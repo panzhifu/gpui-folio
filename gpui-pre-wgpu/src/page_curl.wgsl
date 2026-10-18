@@ -49,7 +49,7 @@ struct CurlUniforms {
 @group(3) @binding(1) var shadow_sampler: sampler;
 
 const PI: f32 = 3.141592653589793;
-const SHADOW_BIAS: f32 = 0.0015;
+const SHADOW_BIAS: f32 = 0.01;
 
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -150,17 +150,18 @@ fn sample_shadow(light_pos: vec4<f32>) -> f32 {
         return 1.0;
     }
 
-    let texel = 1.0 / max(curl.shadow_map_size, 1.0);
+    let texel = 1.0 / max(curl.shadow_map_size, 1.0) * 2.0;
     var lit: f32 = 0.0;
-    for (var y: i32 = -1; y <= 1; y = y + 1) {
-        for (var x: i32 = 1; x >= -1; x = x - 1) {
+    // 5×5 PCF：3×3 在 1024 的图上只有约 1px，真机上就是一条硬边黑带。
+    for (var y: i32 = -2; y <= 2; y = y + 1) {
+        for (var x: i32 = 2; x >= -2; x = x - 1) {
             let offset = vec2<f32>(f32(x), f32(y)) * texel;
             let stored = textureSample(shadow_texture, shadow_sampler, uv + offset).r;
             let shadowed = select(1.0, 0.0, ndc.z > stored + SHADOW_BIAS);
             lit = lit + shadowed;
         }
     }
-    return lit / 9.0;
+    return lit / 25.0;
 }
 
 @fragment
@@ -227,6 +228,6 @@ fn vs_overlay(input: VertexInput) -> OverlayOutput {
 @fragment
 fn fs_overlay(in: OverlayOutput) -> @location(0) vec4<f32> {
     let shadow = sample_shadow(in.light_pos);
-    let alpha = (1.0 - shadow) * 0.38;
+    let alpha = (1.0 - shadow) * 0.20;
     return vec4<f32>(0.0, 0.0, 0.0, alpha);
 }
