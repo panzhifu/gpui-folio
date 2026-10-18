@@ -1,0 +1,12 @@
+[package]
+name = "folio-curl"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Page-curl mesh, uniforms and animation model for folio"
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+naga = { version = "29", features = ["wgsl-in"] }

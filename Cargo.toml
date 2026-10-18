@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["gpui-pre", "gpui-pre-wgpu", "folio-curl"]
+
+# 这棵分叉树的唯一目的：给 folio 的仿真翻页补上
+#   - 自定义网格 primitive（页面纹理的圆柱形变）
+#   - 页面帧捕获（把当前页烘成纹理）
+#   - 阴影 pass（卷曲纸投在新页上的影子）
+#
+# 两个上游 crate 的包名与版本必须保持 0.3.9：folio 的 gpui-kit / gpui-mobile
+# 都精确依赖 `gpui-pre =0.3.9` / `gpui-pre-wgpu =0.3.9`，改包名或版本会让
+# 整张依赖图分出第二棵 gpui，类型对不上。
+[patch.crates-io]
+gpui-pre = { path = "gpui-pre" }
+gpui-pre-wgpu = { path = "gpui-pre-wgpu" }
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
