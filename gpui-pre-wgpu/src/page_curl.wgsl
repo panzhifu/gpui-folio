@@ -152,16 +152,18 @@ fn sample_shadow(light_pos: vec4<f32>) -> f32 {
 
     let texel = 1.0 / max(curl.shadow_map_size, 1.0) * 2.0;
     var lit: f32 = 0.0;
-    // 5×5 PCF：3×3 在 1024 的图上只有约 1px，真机上就是一条硬边黑带。
-    for (var y: i32 = -2; y <= 2; y = y + 1) {
-        for (var x: i32 = 2; x >= -2; x = x - 1) {
+    // 3×3 PCF（9 次采样）。5×5 在 1080×2400 的全页 overlay 上是每像素
+    // 25 次 shadow 采样，真机上直接掉帧；bias 已经按 8 位深度调到 0.01，
+    // 3×3 足够把自阴影硬边磨软。
+    for (var y: i32 = -1; y <= 1; y = y + 1) {
+        for (var x: i32 = 1; x >= -1; x = x - 1) {
             let offset = vec2<f32>(f32(x), f32(y)) * texel;
             let stored = textureSample(shadow_texture, shadow_sampler, uv + offset).r;
             let shadowed = select(1.0, 0.0, ndc.z > stored + SHADOW_BIAS);
             lit = lit + shadowed;
         }
     }
-    return lit / 25.0;
+    return lit / 9.0;
 }
 
 @fragment
