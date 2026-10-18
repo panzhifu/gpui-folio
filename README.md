@@ -28,7 +28,17 @@ folio 现在那套 `Shades` 只能填多边形和两段线性渐变。它能画�
 
 ## 依赖接法
 
-folio 根 `Cargo.toml`：
+已推送到 <https://github.com/panzhifu/gpui-folio>（public）。
+
+folio 根 `Cargo.toml` 用远端提交（推荐，构建可复现）：
+
+```toml
+[patch.crates-io]
+gpui-pre = { git = "https://github.com/panzhifu/gpui-folio", rev = "3ebf9172532c82c90e55e11e99604af7b33cc0dd" }
+gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-folio", rev = "3ebf9172532c82c90e55e11e99604af7b33cc0dd" }
+```
+
+本地开发也可以继续用 path：
 
 ```toml
 [patch.crates-io]
@@ -37,7 +47,8 @@ gpui-pre-wgpu = { path = "../gpui-folio/gpui-pre-wgpu" }
 ```
 
 包名与版本必须保持 `gpui-pre 0.3.9` / `gpui-pre-wgpu 0.3.9`：`gpui-kit` 与
-`gpui-mobile` 都精确依赖这两个版本，改版本会分出第二棵 gpui。
+`gpui-mobile` 都精确依赖这两个版本，改版本会分出第二棵 gpui。Cargo 能从同一个
+git workspace 里解析这两个包，实测 `cargo metadata` 已通过。
 
 ## 当前状态
 
