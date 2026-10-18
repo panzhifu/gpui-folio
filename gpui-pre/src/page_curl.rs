@@ -55,6 +55,13 @@ pub struct PageCurlUniforms {
     pub light_dir: [f32; 4],
     /// 阴影 map 的尺寸（像素），用于 PCF 的纹素偏移。
     pub shadow_map_size: f32,
+    /// 圆锥卷曲：锥顶在折线坐标（沿折线的轴）上的位置。
+    ///
+    /// 半径按「到锥顶的距离」线性收，锥顶处接近 0。`apex_v == finger_v`
+    /// 时退化成等半径圆柱（竖折、没有可定义的锥顶）。
+    pub apex_v: f32,
+    /// 手指在折线坐标上的位置；`radius` 是这一点的卷筒半径。
+    pub finger_v: f32,
 }
 
 /// 调用方交给 [`Window::paint_page_curl_mesh`](crate::Window::paint_page_curl_mesh)

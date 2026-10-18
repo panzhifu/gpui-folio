@@ -37,6 +37,9 @@ struct CurlUniforms {
     back_color: vec4<f32>,
     light_dir: vec4<f32>,
     shadow_map_size: f32,
+    apex_v: f32,
+    finger_v: f32,
+    _pad0: f32,
     light_view_proj: mat4x4<f32>,
 }
 
@@ -64,6 +67,8 @@ struct VertexOutput {
     @location(3) world: vec3<f32>,
     /// 到页面外框的像素距离；片元用它压一道纸边光。
     @location(4) edge: f32,
+    /// 背面离折痕的距离（0 = 贴着折痕，1 = 自由边），给背面压内侧渐变。
+    @location(5) back_fade: f32,
 }
 
 struct ShadowOutput {
@@ -74,6 +79,8 @@ struct ShadowOutput {
 struct Deformed {
     position: vec3<f32>,
     normal: vec3<f32>,
+    /// 背面离折痕的归一化距离；正面恒 0。
+    back_fade: f32,
 }
 
 fn to_device_position(position: vec2<f32>, depth: f32) -> vec4<f32> {
@@ -84,14 +91,28 @@ fn to_device_position(position: vec2<f32>, depth: f32) -> vec4<f32> {
 fn deform(page_position: vec2<f32>) -> Deformed {
     let p = page_position * curl.scale_factor;
     let n = curl.axis_normal;
-    let r = max(curl.radius, 0.001);
     let d = dot(n, p) - curl.axis_d;
     let center = curl.page_size * 0.5;
     let tangent = vec2<f32>(-n.y, n.x);
+    // 手指在折线上的垂足；圆锥的半径按「它到锥顶的距离」线性收。
+    let axis_foot = p - n * d;
+    let v_rel = dot(tangent, axis_foot - center);
+    let short = min(curl.page_size.x, curl.page_size.y);
+    let span = abs(curl.finger_v - curl.apex_v);
+    var r = max(curl.radius, 0.001);
+    if (span > 1.0) {
+        // 锥顶处收到 2% 短边（不是 0，避免 θ/R 爆掉），外缘最多 30% 短边。
+        r = clamp(
+            curl.radius * abs(v_rel - curl.apex_v) / span,
+            0.02 * short,
+            0.30 * short,
+        );
+    }
 
     var u: f32;
     var z: f32;
     var normal: vec3<f32>;
+    var back_fade: f32 = 0.0;
 
     if (d <= 0.0) {
         // 平摊：原样，法线朝上。
@@ -109,6 +130,7 @@ fn deform(page_position: vec2<f32>) -> Deformed {
         u = PI * r - d;
         z = 2.0 * r;
         normal = vec3<f32>(0.0, 0.0, -1.0);
+        back_fade = clamp((d / r - PI) / 1.5, 0.0, 1.0);
     }
 
     // 弱透视：相机在页面上方，z 越大离读者越近，投影越大。
@@ -116,12 +138,10 @@ fn deform(page_position: vec2<f32>) -> Deformed {
     // 平摊时 `u = d`，这一串必须正好还原成 `p`：
     //   axis_foot + n*d = p
     // 卷曲时才把横截面坐标换成 `u = R·sinθ`。
-    let axis_foot = p - n * d;
-    let v_rel = dot(tangent, axis_foot - center);
     let axis_foot_proj = axis_foot - tangent * v_rel + tangent * (v_rel * scale);
     let world2 = curl.page_origin + axis_foot_proj + n * u * scale;
 
-    return Deformed(vec3<f32>(world2, z), normal);
+    return Deformed(vec3<f32>(world2, z), normal, back_fade);
 }
 
 @vertex
@@ -133,6 +153,7 @@ fn vs_page_curl(input: VertexInput) -> VertexOutput {
     out.position = to_device_position(def.position.xy, depth);
     out.uv = (curl.page_origin + input.position * curl.scale_factor) / curl.window_size;
     out.normal = def.normal;
+    out.back_fade = def.back_fade;
     out.world = def.position;
     out.light_pos = curl.light_view_proj * vec4<f32>(def.position, 1.0);
     let local = input.position * curl.scale_factor;
@@ -166,6 +187,20 @@ fn sample_shadow(light_pos: vec4<f32>) -> f32 {
     return lit / 9.0;
 }
 
+/// 全页 overlay 专用：只看一次 shadow map。
+///
+/// overlay 覆盖 1080×2400 整页，3×3 也要两千万次采样/帧；它只是一层 20% 的
+/// 投影，单次采样足够，边缘的硬一点由低 alpha 和网格自阴影补回来。
+fn sample_shadow_fast(light_pos: vec4<f32>) -> f32 {
+    let ndc = light_pos.xyz / light_pos.w;
+    let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        return 1.0;
+    }
+    let stored = textureSample(shadow_texture, shadow_sampler, uv).r;
+    return select(1.0, 0.0, ndc.z > stored + SHADOW_BIAS);
+}
+
 @fragment
 fn fs_page_curl(
     in: VertexOutput,
@@ -185,8 +220,9 @@ fn fs_page_curl(
         // 平摊页（n.z = 1）亮度正好 1；卷曲处按 N·L 压暗。
         brightness = clamp(0.55 + 0.45 * (diffuse / light_z), 0.35, 1.0);
     } else {
-        // 背面：纸色 + 环境光。不采样正面纹理，避免把正文镜像到背面。
-        base = curl.back_color.rgb;
+        // 背面：纸色 + 环境光，靠折痕压一道内侧渐变（0.82 → 1.0），
+        // 否则拖到后半程整条背面读成一块灰色平带。
+        base = curl.back_color.rgb * (0.82 + 0.18 * in.back_fade);
         brightness = 0.92;
     }
 
@@ -229,7 +265,7 @@ fn vs_overlay(input: VertexInput) -> OverlayOutput {
 
 @fragment
 fn fs_overlay(in: OverlayOutput) -> @location(0) vec4<f32> {
-    let shadow = sample_shadow(in.light_pos);
+    let shadow = sample_shadow_fast(in.light_pos);
     let alpha = (1.0 - shadow) * 0.20;
     return vec4<f32>(0.0, 0.0, 0.0, alpha);
 }

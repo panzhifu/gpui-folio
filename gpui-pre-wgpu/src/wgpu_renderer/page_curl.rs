@@ -31,9 +31,10 @@ struct GpuCurlUniforms {
     back_color: [f32; 4],
     light_dir: [f32; 4],
     shadow_map_size: f32,
-    // WGSL 的 mat4x4 按 16 字节对齐，`shadow_map_size` 之后留 12 字节空洞；
-    // repr(C) 不会替数组做这件事，必须显式补齐。总共 160 字节。
-    _pad0: [f32; 3],
+    apex_v: f32,
+    finger_v: f32,
+    // `shadow_map_size + 3*f32` 之后 mat4 正好 96 字节对齐；补到 96。
+    _pad0: f32,
     light_view_proj: [[f32; 4]; 4],
 }
 
@@ -51,7 +52,9 @@ impl GpuCurlUniforms {
             back_color: uniforms.back_color,
             light_dir: uniforms.light_dir,
             shadow_map_size: uniforms.shadow_map_size,
-            _pad0: [0.0; 3],
+            apex_v: uniforms.apex_v,
+            finger_v: uniforms.finger_v,
+            _pad0: 0.0,
             light_view_proj,
         }
     }
@@ -237,12 +240,20 @@ struct ShadowTexture {
 }
 
 struct FrameDraw {
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
     index_count: u32,
     /// 卷曲网格的页框（不是 canvas 的整块 content mask）：剪到版心，
     /// 避免卷起来那一截画到页眉/页脚上。
     page_bounds: Bounds<ScaledPixels>,
+}
+
+/// 页面网格的顶点/索引只由版心尺寸和网格分辨率决定，翻页进度只改 uniform。
+/// 按 `(page_size, vertex_count, index_count)` 缓存，翻页期间不再每帧 create_buffer。
+struct GeometryCache {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+    vertex_count: usize,
+    page_size: [f32; 2],
 }
 
 pub(super) struct PageCurlResources {
@@ -254,6 +265,7 @@ pub(super) struct PageCurlResources {
     fallback_bind_group: wgpu::BindGroup,
     depth: Option<DepthTexture>,
     shadow: Option<ShadowTexture>,
+    geometry: Option<GeometryCache>,
     frame: Option<FrameDraw>,
     target_format: wgpu::TextureFormat,
 }
@@ -349,6 +361,7 @@ impl PageCurlResources {
             fallback_bind_group,
             depth: None,
             shadow: None,
+            geometry: None,
             frame: None,
             target_format,
         }
@@ -358,6 +371,7 @@ impl PageCurlResources {
         self.capture = None;
         self.depth = None;
         self.shadow = None;
+        self.geometry = None;
         self.frame = None;
     }
 
@@ -374,32 +388,47 @@ impl PageCurlResources {
             self.frame = None;
             return Ok(());
         };
-        let vertex_bytes = bytemuck::cast_slice(mesh.vertices.as_ref());
-        let index_bytes = bytemuck::cast_slice(mesh.indices.as_ref());
-        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("page_curl_vertices"),
-            size: vertex_bytes.len().max(1) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let vertex_count = mesh.vertices.len();
+        let index_count = mesh.indices.len() as u32;
+        let cache_hit = self.geometry.as_ref().is_some_and(|geometry| {
+            geometry.page_size == mesh.uniforms.page_size
+                && geometry.vertex_count == vertex_count
+                && geometry.index_count == index_count
         });
-        queue.write_buffer(&vertex_buffer, 0, vertex_bytes);
+        if !cache_hit {
+            let vertex_bytes = bytemuck::cast_slice(mesh.vertices.as_ref());
+            let index_bytes = bytemuck::cast_slice(mesh.indices.as_ref());
+            let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("page_curl_vertices"),
+                size: vertex_bytes.len().max(1) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&vertex_buffer, 0, vertex_bytes);
 
-        let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("page_curl_indices"),
-            size: index_bytes.len().max(4) as u64,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&index_buffer, 0, index_bytes);
+            let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("page_curl_indices"),
+                size: index_bytes.len().max(4) as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&index_buffer, 0, index_bytes);
+
+            self.geometry = Some(GeometryCache {
+                vertex_buffer,
+                index_buffer,
+                index_count,
+                vertex_count,
+                page_size: mesh.uniforms.page_size,
+            });
+        }
 
         let light_view_proj = light_view_proj(&mesh.uniforms);
         let uniforms = GpuCurlUniforms::from_parts(&mesh.uniforms, light_view_proj);
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
         self.frame = Some(FrameDraw {
-            vertex_buffer,
-            index_buffer,
-            index_count: mesh.indices.len() as u32,
+            index_count,
             page_bounds: mesh.bounds,
         });
 
@@ -533,7 +562,11 @@ impl PageCurlResources {
         encoder: &mut wgpu::CommandEncoder,
         globals_bind_group: &wgpu::BindGroup,
     ) {
-        let (Some(frame), Some(shadow)) = (self.frame.as_ref(), self.shadow.as_ref()) else {
+        let (Some(frame), Some(geometry), Some(shadow)) = (
+            self.frame.as_ref(),
+            self.geometry.as_ref(),
+            self.shadow.as_ref(),
+        ) else {
             return;
         };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -553,20 +586,23 @@ impl PageCurlResources {
         pass.set_pipeline(&self.pipelines.shadow);
         pass.set_bind_group(0, globals_bind_group, &[]);
         pass.set_bind_group(1, &self.uniform_bind_group, &[]);
-        pass.set_vertex_buffer(0, frame.vertex_buffer.slice(..));
-        pass.set_index_buffer(frame.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
+        pass.set_index_buffer(geometry.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..frame.index_count, 0, 0..1);
     }
 
     /// 在新页上铺投影，再画卷曲网格。`target` 是主颜色附件。
     pub(super) fn encode_mesh_pass(
-        &mut self,
+        &self,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         size: Size<DevicePixels>,
         globals_bind_group: &wgpu::BindGroup,
     ) {
         let Some(frame) = self.frame.as_ref() else {
+            return;
+        };
+        let Some(geometry) = self.geometry.as_ref() else {
             return;
         };
         let Some(depth) = self.depth.as_ref() else {
@@ -624,8 +660,8 @@ impl PageCurlResources {
             pass.set_bind_group(1, &self.uniform_bind_group, &[]);
             pass.set_bind_group(2, capture_bind_group, &[]);
             pass.set_bind_group(3, &shadow.bind_group, &[]);
-            pass.set_vertex_buffer(0, frame.vertex_buffer.slice(..));
-            pass.set_index_buffer(frame.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
+            pass.set_index_buffer(geometry.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..frame.index_count, 0, 0..1);
         }
     }
