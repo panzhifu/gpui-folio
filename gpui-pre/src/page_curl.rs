@@ -7,6 +7,11 @@
 //! 顶点是**页面局部逻辑像素**，`uv` 是页面纹理坐标；Windows 在
 //! [`paint_page_curl_mesh`](crate::Window::paint_page_curl_mesh) 里把
 //! 长度字段统一乘 `scale_factor`，着色器不再猜 DPI。
+//!
+//! 捕获纹理铺的是**整窗大小**、只有请求那一块被写过，所以采样的 `uv` 是窗口归一的：
+//! `(page_origin + 局部坐标) / window_size`。这条等式要求调用方给的 `page_origin` 与
+//! `page_size` 就是 [`capture_page_region`](crate::Window::capture_page_region) 那块矩形
+//! 本身 —— 差一个页边距，卷起来那一片就采到横移的页面，读成「纸上的字对不齐」。
 
 use std::sync::Arc;
 
@@ -53,15 +58,14 @@ pub struct PageCurlUniforms {
     pub back_color: [f32; 4],
     /// 光照方向（页面/视线空间，指向光源）。
     pub light_dir: [f32; 4],
-    /// 阴影 map 的尺寸（像素），用于 PCF 的纹素偏移。
-    pub shadow_map_size: f32,
-    /// 圆锥卷曲：锥顶在折线坐标（沿折线的轴）上的位置。
+    /// **烘那张纹理那一刻**页面左上角在窗口里的位置（设备像素）。
     ///
-    /// 半径按「到锥顶的距离」线性收，锥顶处接近 0。`apex_v == finger_v`
-    /// 时退化成等半径圆柱（竖折、没有可定义的锥顶）。
-    pub apex_v: f32,
-    /// 手指在折线坐标上的位置；`radius` 是这一点的卷筒半径。
-    pub finger_v: f32,
+    /// 它与 [`Self::page_origin`] 分开是有原因的：那张纹理里被写过的只有烘的那一刻那一块矩形，
+    /// 而网格取 uv 按「原点 + 局部坐标」归一。阅读层在动（进出书的 280 ms 视差滑动、面板位移、
+    /// 尺寸变化）时两者就不是同一个数，差出来的那一截采到未写区域 —— 真机量到的是左缘一条
+    /// 378 设备像素的纯黑带（烘的那一刻栏还偏着 134.4 逻辑像素）。几何照**本帧**的 `page_origin`
+    /// 摆，采样照**烘时**的这里给，两类错位一起消失。
+    pub capture_origin: [f32; 2],
 }
 
 /// 调用方交给 [`Window::paint_page_curl_mesh`](crate::Window::paint_page_curl_mesh)

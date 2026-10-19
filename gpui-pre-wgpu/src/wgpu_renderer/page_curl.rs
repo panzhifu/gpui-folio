@@ -1,11 +1,10 @@
 //! 页面卷曲的 GPU 资源与绘制。
 //!
 //! 这个子模块挂在 `wgpu_renderer` 下，能拿到父模块的私有字段与类型；对外只
-//! 暴露 `PageCurlResources` 的三个入口：
+//! 暴露 `PageCurlResources` 的两个入口：
 //!
-//! - `prepare`：从场景里取第一张网格，建顶点/索引缓冲、上传 uniform、准备阴影图；
-//! - `encode_shadow`：把网格从光源方向烘进 shadow map；
-//! - `encode_mesh_pass`：先铺新页投影，再画卷曲网格（带深度）。
+//! - `prepare`：从场景里取第一张网格，建顶点/索引缓冲、上传这一帧的 uniform；
+//! - `encode_mesh_pass`：单独开一趟带深度的 pass 画卷曲网格。
 //!
 //! 页面捕获本身由父模块的 `record_scene` 负责：这里只提供捕获纹理的 view 与
 //! bind group。
@@ -14,8 +13,6 @@ use super::*;
 use gpui::PageCurlUniforms;
 
 const PAGE_CURL_SHADERS: &str = include_str!("../page_curl.wgsl");
-
-const SHADOW_MAP_SIZE: u32 = 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -30,16 +27,12 @@ struct GpuCurlUniforms {
     scale_factor: f32,
     back_color: [f32; 4],
     light_dir: [f32; 4],
-    shadow_map_size: f32,
-    apex_v: f32,
-    finger_v: f32,
-    // `shadow_map_size + 3*f32` 之后 mat4 正好 96 字节对齐；补到 96。
-    _pad0: f32,
-    light_view_proj: [[f32; 4]; 4],
+    capture_origin: [f32; 2],
+    _padding: [f32; 2],
 }
 
 impl GpuCurlUniforms {
-    fn from_parts(uniforms: &PageCurlUniforms, light_view_proj: [[f32; 4]; 4]) -> Self {
+    fn from_parts(uniforms: &PageCurlUniforms) -> Self {
         Self {
             page_origin: uniforms.page_origin,
             page_size: uniforms.page_size,
@@ -51,19 +44,14 @@ impl GpuCurlUniforms {
             scale_factor: uniforms.scale_factor,
             back_color: uniforms.back_color,
             light_dir: uniforms.light_dir,
-            shadow_map_size: uniforms.shadow_map_size,
-            apex_v: uniforms.apex_v,
-            finger_v: uniforms.finger_v,
-            _pad0: 0.0,
-            light_view_proj,
+            capture_origin: uniforms.capture_origin,
+            _padding: [0.0; 2],
         }
     }
 }
 
 pub(super) struct PageCurlPipelines {
     mesh: wgpu::RenderPipeline,
-    shadow: wgpu::RenderPipeline,
-    overlay: wgpu::RenderPipeline,
 }
 
 pub(super) fn create_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -167,12 +155,8 @@ pub(super) fn create_pipelines(
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState::default(),
     };
-    let overlay_depth = wgpu::DepthStencilState {
-        depth_write_enabled: Some(false),
-        depth_compare: Some(wgpu::CompareFunction::Always),
-        ..mesh_depth.clone()
-    };
 
+    // 片元给回的 alpha 恒为 1，这一趟本来就是不透明的：开着混合只是让整页多一次读改写。
     let mesh = create(
         "page_curl_mesh",
         "vs_page_curl",
@@ -181,43 +165,13 @@ pub(super) fn create_pipelines(
             Some(&layouts.globals),
             Some(&layouts.page_curl_uniforms),
             Some(&layouts.texture),
-            Some(&layouts.texture),
         ],
         target_format,
         Some(mesh_depth),
-        Some(wgpu::BlendState::ALPHA_BLENDING),
-    );
-
-    let shadow = create(
-        "page_curl_shadow",
-        "vs_shadow",
-        "fs_shadow",
-        &[Some(&layouts.globals), Some(&layouts.page_curl_uniforms)],
-        wgpu::TextureFormat::Rgba8Unorm,
-        None,
         None,
     );
 
-    let overlay = create(
-        "page_curl_overlay",
-        "vs_overlay",
-        "fs_overlay",
-        &[
-            Some(&layouts.globals),
-            Some(&layouts.page_curl_uniforms),
-            Some(&layouts.texture),
-            Some(&layouts.texture),
-        ],
-        target_format,
-        Some(overlay_depth),
-        Some(wgpu::BlendState::ALPHA_BLENDING),
-    );
-
-    PageCurlPipelines {
-        mesh,
-        shadow,
-        overlay,
-    }
+    PageCurlPipelines { mesh }
 }
 
 struct CaptureTexture {
@@ -231,12 +185,6 @@ struct DepthTexture {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
     size: Size<DevicePixels>,
-}
-
-struct ShadowTexture {
-    _texture: wgpu::Texture,
-    view: wgpu::TextureView,
-    bind_group: wgpu::BindGroup,
 }
 
 struct FrameDraw {
@@ -262,9 +210,7 @@ pub(super) struct PageCurlResources {
     uniform_bind_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
     capture: Option<CaptureTexture>,
-    fallback_bind_group: wgpu::BindGroup,
     depth: Option<DepthTexture>,
-    shadow: Option<ShadowTexture>,
     geometry: Option<GeometryCache>,
     frame: Option<FrameDraw>,
     target_format: wgpu::TextureFormat,
@@ -273,7 +219,6 @@ pub(super) struct PageCurlResources {
 impl PageCurlResources {
     pub(super) fn new(
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
         layouts: &WgpuBindGroupLayouts,
         pipelines: PageCurlPipelines,
         target_format: wgpu::TextureFormat,
@@ -295,61 +240,13 @@ impl PageCurlResources {
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("page_curl_sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            // 捕获纹理与卷曲网格是 1:1 的设备像素。最近邻既保住正文的锐度，也避免
+            // 线性过滤在矩形外圈与清屏色之间揉出一条半透明灰边（参照实现同样用 NEAREST）。
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
-        });
-
-        // 还没捕获页面时绑一张 1×1 透明纹理，避免整条管线因为缺绑定而跳过。
-        let fallback_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("page_curl_fallback"),
-            size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: target_format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &fallback_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &[0u8; 4],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-        );
-        let fallback_view = fallback_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let fallback_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("page_curl_fallback_bind_group"),
-            layout: &layouts.texture,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&fallback_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
         });
 
         Self {
@@ -358,9 +255,7 @@ impl PageCurlResources {
             uniform_bind_group,
             sampler,
             capture: None,
-            fallback_bind_group,
             depth: None,
-            shadow: None,
             geometry: None,
             frame: None,
             target_format,
@@ -370,18 +265,16 @@ impl PageCurlResources {
     pub(super) fn invalidate_size_dependent(&mut self) {
         self.capture = None;
         self.depth = None;
-        self.shadow = None;
         self.geometry = None;
         self.frame = None;
     }
 
-    /// 从场景里取第一张网格，准备这一帧的顶点/索引缓冲、uniform 与阴影图。
+    /// 从场景里取第一张网格，准备这一帧的顶点/索引缓冲与 uniform。
     pub(super) fn prepare(
         &mut self,
         scene: &Scene,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        layouts: &WgpuBindGroupLayouts,
         size: Size<DevicePixels>,
     ) -> Result<()> {
         let Some(mesh) = scene.page_curl_meshes.first() else {
@@ -423,8 +316,7 @@ impl PageCurlResources {
             });
         }
 
-        let light_view_proj = light_view_proj(&mesh.uniforms);
-        let uniforms = GpuCurlUniforms::from_parts(&mesh.uniforms, light_view_proj);
+        let uniforms = GpuCurlUniforms::from_parts(&mesh.uniforms);
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
         self.frame = Some(FrameDraw {
@@ -432,49 +324,8 @@ impl PageCurlResources {
             page_bounds: mesh.bounds,
         });
 
-        self.ensure_shadow(device, layouts);
         self.ensure_depth(device, size);
         Ok(())
-    }
-
-    fn ensure_shadow(&mut self, device: &wgpu::Device, layouts: &WgpuBindGroupLayouts) {
-        if self.shadow.is_some() {
-            return;
-        }
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("page_curl_shadow_map"),
-            size: wgpu::Extent3d {
-                width: SHADOW_MAP_SIZE,
-                height: SHADOW_MAP_SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("page_curl_shadow_bind_group"),
-            layout: &layouts.texture,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
-        self.shadow = Some(ShadowTexture {
-            _texture: texture,
-            view,
-            bind_group,
-        });
     }
 
     pub(super) fn capture_view(
@@ -556,42 +407,7 @@ impl PageCurlResources {
         });
     }
 
-    /// 把网格从光源方向渲染进 shadow map。必须在主 pass 之前调用。
-    pub(super) fn encode_shadow(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        globals_bind_group: &wgpu::BindGroup,
-    ) {
-        let (Some(frame), Some(geometry), Some(shadow)) = (
-            self.frame.as_ref(),
-            self.geometry.as_ref(),
-            self.shadow.as_ref(),
-        ) else {
-            return;
-        };
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("page_curl_shadow_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &shadow.view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            ..Default::default()
-        });
-        pass.set_pipeline(&self.pipelines.shadow);
-        pass.set_bind_group(0, globals_bind_group, &[]);
-        pass.set_bind_group(1, &self.uniform_bind_group, &[]);
-        pass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
-        pass.set_index_buffer(geometry.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..frame.index_count, 0, 0..1);
-    }
-
-    /// 在新页上铺投影，再画卷曲网格。`target` 是主颜色附件。
+    /// 画卷曲网格。`target` 是主颜色附件。
     pub(super) fn encode_mesh_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -608,14 +424,15 @@ impl PageCurlResources {
         let Some(depth) = self.depth.as_ref() else {
             return;
         };
-        let Some(shadow) = self.shadow.as_ref() else {
+        // 没有捕获纹理就**不画这一趟**。从前这里绑一张 1×1 的透明黑兜底，理由是「别让管线因为
+        // 缺绑定而跳过」，而它正是那条黑的来源：尺寸一变（`invalidate_size_dependent` 把纹理清了）
+        // 或者翻页赶在烘纹理之前，整片纸就读成黑。跳过只是「这一趟没卷起来」—— 下面那张页本来
+        // 就在那儿，读起来是一次普通的落定；绑黑读起来是屏幕上一条黑带。
+        let Some(capture) = self.capture.as_ref() else {
+            log::debug!("page_curl: 缺捕获纹理，这一帧不画卷曲网格");
             return;
         };
-        let capture_bind_group = self
-            .capture
-            .as_ref()
-            .map(|capture| &capture.bind_group)
-            .unwrap_or(&self.fallback_bind_group);
+        let capture_bind_group = &capture.bind_group;
 
         let b = frame.page_bounds;
         let x = b.origin.x.0.max(0.0) as u32;
@@ -644,7 +461,9 @@ impl PageCurlResources {
                 view: &depth.view,
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
+                    // 这一趟的深度只在网格自己之间分先后，出去没人再读。留着一个窗口大的
+                    // 深度缓冲写回内存，换来的是一次从来没人读的读回。
+                    store: wgpu::StoreOp::Discard,
                 }),
                 stencil_ops: None,
             }),
@@ -654,108 +473,12 @@ impl PageCurlResources {
             pass.set_scissor_rect(x, y, width, height);
         }
 
-        for pipeline in [&self.pipelines.overlay, &self.pipelines.mesh] {
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, globals_bind_group, &[]);
-            pass.set_bind_group(1, &self.uniform_bind_group, &[]);
-            pass.set_bind_group(2, capture_bind_group, &[]);
-            pass.set_bind_group(3, &shadow.bind_group, &[]);
-            pass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
-            pass.set_index_buffer(geometry.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..frame.index_count, 0, 0..1);
-        }
+        pass.set_pipeline(&self.pipelines.mesh);
+        pass.set_bind_group(0, globals_bind_group, &[]);
+        pass.set_bind_group(1, &self.uniform_bind_group, &[]);
+        pass.set_bind_group(2, capture_bind_group, &[]);
+        pass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
+        pass.set_index_buffer(geometry.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..frame.index_count, 0, 0..1);
     }
-}
-
-fn normalize(v: [f32; 3]) -> [f32; 3] {
-    let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
-    [v[0] / length, v[1] / length, v[2] / length]
-}
-
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-type Mat4 = [[f32; 4]; 4];
-
-fn mul(a: Mat4, b: Mat4) -> Mat4 {
-    let mut out = [[0.0f32; 4]; 4];
-    for column in 0..4 {
-        for row in 0..4 {
-            out[column][row] = (0..4).map(|k| a[k][row] * b[column][k]).sum();
-        }
-    }
-    out
-}
-
-fn ortho(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> Mat4 {
-    [
-        [2.0 / (right - left), 0.0, 0.0, 0.0],
-        [0.0, 2.0 / (top - bottom), 0.0, 0.0],
-        [0.0, 0.0, 1.0 / (far - near), 0.0],
-        [
-            -(right + left) / (right - left),
-            -(top + bottom) / (top - bottom),
-            -near / (far - near),
-            1.0,
-        ],
-    ]
-}
-
-fn look_at(eye: [f32; 3], center: [f32; 3], up: [f32; 3]) -> Mat4 {
-    let forward = normalize([center[0] - eye[0], center[1] - eye[1], center[2] - eye[2]]);
-    let right = normalize(cross(forward, up));
-    let up = cross(right, forward);
-    [
-        [right[0], up[0], -forward[0], 0.0],
-        [right[1], up[1], -forward[1], 0.0],
-        [right[2], up[2], -forward[2], 0.0],
-        [-dot(right, eye), -dot(up, eye), dot(forward, eye), 1.0],
-    ]
-}
-
-fn light_view_proj(uniforms: &PageCurlUniforms) -> [[f32; 4]; 4] {
-    let direction = normalize([
-        uniforms.light_dir[0],
-        uniforms.light_dir[1],
-        uniforms.light_dir[2],
-    ]);
-    let center = [
-        uniforms.page_origin[0] + uniforms.page_size[0] * 0.5,
-        uniforms.page_origin[1] + uniforms.page_size[1] * 0.5,
-        0.0,
-    ];
-    let diagonal = (uniforms.page_size[0] * uniforms.page_size[0]
-        + uniforms.page_size[1] * uniforms.page_size[1])
-        .sqrt()
-        .max(1.0);
-    let distance = diagonal * 2.0;
-    let eye = [
-        center[0] + direction[0] * distance,
-        center[1] + direction[1] * distance,
-        center[2] + direction[2] * distance,
-    ];
-    let up = if direction[1].abs() > 0.95 {
-        [0.0, 0.0, 1.0]
-    } else {
-        [0.0, 1.0, 0.0]
-    };
-    let extent = diagonal * 0.65 + uniforms.radius * 2.5 + 8.0;
-    let projection = ortho(
-        -extent,
-        extent,
-        -extent,
-        extent,
-        0.1,
-        distance * 2.0 + uniforms.radius * 4.0,
-    );
-    mul(projection, look_at(eye, center, up))
 }

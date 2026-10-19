@@ -13,17 +13,17 @@ use crate::{
     Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
     Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PageCurlMesh,
-    PageCurlMeshPrimitive, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    PageCurlMeshPrimitive, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
+    TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange, TextRenderingMode,
+    TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point, prelude::*, px, rems,
+    size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -4790,6 +4790,10 @@ impl Window {
             uniforms.page_size[0] * scale_factor,
             uniforms.page_size[1] * scale_factor,
         ];
+        uniforms.capture_origin = [
+            uniforms.capture_origin[0] * scale_factor,
+            uniforms.capture_origin[1] * scale_factor,
+        ];
         uniforms.window_size = [
             f32::from(viewport.width) * scale_factor,
             f32::from(viewport.height) * scale_factor,
@@ -4799,15 +4803,17 @@ impl Window {
         uniforms.camera_distance *= scale_factor;
         uniforms.scale_factor = scale_factor;
 
-        self.next_frame.scene.insert_primitive(PageCurlMeshPrimitive {
-            order: 0,
-            bounds: mesh.bounds.scale(scale_factor),
-            content_mask,
-            page_bounds: mesh.page_bounds.scale(scale_factor),
-            vertices: mesh.vertices,
-            indices: mesh.indices,
-            uniforms,
-        });
+        self.next_frame
+            .scene
+            .insert_primitive(PageCurlMeshPrimitive {
+                order: 0,
+                bounds: mesh.bounds.scale(scale_factor),
+                content_mask,
+                page_bounds: mesh.page_bounds.scale(scale_factor),
+                vertices: mesh.vertices,
+                indices: mesh.indices,
+                uniforms,
+            });
     }
 
     /// 请求渲染器把 `bounds` 这一块页面烘成纹理，供后续的卷曲网格采样。
@@ -4816,7 +4822,22 @@ impl Window {
     /// “页面已经稳定、还没开始卷”的那一帧发这个请求，不要在动画的每一帧都发。
     /// 纹理在渲染器里持久保存，直到下一次请求覆盖它。
     pub fn capture_page_region(&mut self, bounds: Bounds<Pixels>) {
-        self.next_frame.scene.page_capture = Some(bounds.scale(self.scale_factor()));
+        self.capture_page_region_with_color(bounds, crate::white().to_rgb());
+    }
+
+    /// 同 [`Self::capture_page_region`]，但把捕获矩形之外的清屏色一起交给渲染器。
+    ///
+    /// 页卷网格只采捕获矩形里面，但插值/半像素取整会让最外一列落到矩形外；清成透明黑就
+    /// 是页边一条黑带，清成纸张同色则最多只是看不出来的一小截边缘。
+    pub fn capture_page_region_with_color(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        clear_color: crate::Rgba,
+    ) {
+        let capture = bounds.scale(self.scale_factor());
+        let scene = &mut self.next_frame.scene;
+        scene.page_capture = Some(capture);
+        scene.page_capture_clear_color = Some(clear_color);
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.
@@ -5866,6 +5887,12 @@ impl Window {
             event.predicted_position = None;
         }
         let recognized_gestures = self.touch_gestures.handle_event(&event);
+        // 先把原始触摸给元素一份，再发识别器折出来的那些事件。理由是顺序上的一前一后：
+        // 折出来的 `ScrollWheelEvent` 只剩一根轴（另一根的增量被 `lock_delta_to_axis` 抹成
+        // 0），而要用二维位置的监听得先拿到这一格，才能在同一笔的后续事件里读到它。
+        // 只加一条广播，识别器那一路一个字都没动。
+        cx.propagate_event = true;
+        self.dispatch_mouse_event(&event, cx);
         if event.phase == crate::TouchPhase::Started
             && let Some(touch_drag) = self.touch_gestures.offer_touch_drag(event.id)
         {

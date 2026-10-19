@@ -1346,7 +1346,6 @@ impl WgpuRendererCore {
         let max_texture_size = device.limits().max_texture_dimension_2d;
         let page_curl = page_curl::PageCurlResources::new(
             &device,
-            &queue,
             &bind_group_layouts,
             page_curl_pipelines,
             target_format,
@@ -1526,11 +1525,7 @@ impl WgpuRendererCore {
             let resources = &mut self.resources;
             let device = &resources.device;
             let queue = &resources.queue;
-            let layouts = &resources.bind_group_layouts;
-            let page_curl = &mut resources.page_curl;
-            page_curl.prepare(scene, device, queue, layouts, size)?;
-            let globals = &resources.globals_bind_group;
-            page_curl.encode_shadow(&mut encoder, globals);
+            resources.page_curl.prepare(scene, device, queue, size)?;
         }
 
         // 页面捕获：把同一棵场景按页面 bounds 重画到离屏纹理。捕获 pass 不画
@@ -1545,12 +1540,24 @@ impl WgpuRendererCore {
                     .capture_view(device, layouts, size)
                     .clone()
             };
+            // 捕获纹理只有被 scissor 的版心那块会被写过，而卷曲网格按窗口归一取 uv；
+            // 采样落在矩形外一两个像素时，透明黑清屏色会直接变成页边黑带。清成纸张色
+            // 与 harism/android-pagecurl 的 `glClearColor(mBackgroundColor)` 是同一个口径。
+            let capture_clear = scene
+                .page_capture_clear_color
+                .map(|color| wgpu::Color {
+                    r: f64::from(color.r),
+                    g: f64::from(color.g),
+                    b: f64::from(color.b),
+                    a: f64::from(color.a),
+                })
+                .unwrap_or(wgpu::Color::WHITE);
             self.encode_scene(
                 scene,
                 &mut encoder,
                 &capture_view,
                 size,
-                wgpu::Color::TRANSPARENT,
+                capture_clear,
                 scissor_for(bounds, size),
                 true,
                 &instance_bindings,
@@ -1618,25 +1625,13 @@ impl WgpuRendererCore {
                     }
 
                     drop(pass);
-                    let rasterized = self.draw_paths_to_intermediate(
-                        encoder,
-                        paths,
-                        instance_offset,
-                    )?;
+                    let rasterized =
+                        self.draw_paths_to_intermediate(encoder, paths, instance_offset)?;
 
-                    pass = begin_color_pass(
-                        encoder,
-                        frame_view,
-                        wgpu::LoadOp::Load,
-                        scissor,
-                    );
+                    pass = begin_color_pass(encoder, frame_view, wgpu::LoadOp::Load, scissor);
 
                     if rasterized {
-                        self.draw_paths_from_intermediate(
-                            paths,
-                            instance_offset,
-                            &mut pass,
-                        )?;
+                        self.draw_paths_from_intermediate(paths, instance_offset, &mut pass)?;
                     }
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_instances(
@@ -1692,12 +1687,7 @@ impl WgpuRendererCore {
                             &resources.globals_bind_group,
                         );
                     }
-                    pass = begin_color_pass(
-                        encoder,
-                        frame_view,
-                        wgpu::LoadOp::Load,
-                        scissor,
-                    );
+                    pass = begin_color_pass(encoder, frame_view, wgpu::LoadOp::Load, scissor);
                 }
                 // Surfaces are macOS-only for video playback and are not
                 // implemented by the WGPU renderer.
@@ -3181,5 +3171,3 @@ mod tests {
         );
     }
 }
-
-

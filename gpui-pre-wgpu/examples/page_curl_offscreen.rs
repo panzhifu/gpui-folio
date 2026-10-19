@@ -96,9 +96,7 @@ fn main() -> anyhow::Result<()> {
             scale_factor: 1.0,
             back_color: [0.92, 0.9, 0.86, 1.0],
             light_dir: [-0.35, -0.25, 1.0, 0.0],
-            shadow_map_size: 1024.0,
-            apex_v: 0.0,
-            finger_v: 0.0,
+            capture_origin: [0.0, 0.0],
         },
     });
 

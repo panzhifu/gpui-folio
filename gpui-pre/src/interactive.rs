@@ -142,6 +142,9 @@ impl InputEvent for TouchEvent {
         PlatformInput::Touch(self)
     }
 }
+// 原始触摸也走元素监听那一条路：一笔拖动被识别器折成 `ScrollWheelEvent` 时，另一根轴的
+// 增量已经被抹成 0，而「纸跟着手指转」要的正是那第二个自由度。
+impl MouseEvent for TouchEvent {}
 
 /// A mouse down event from the platform
 #[derive(Clone, Debug, Default)]

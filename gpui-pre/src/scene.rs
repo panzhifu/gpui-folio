@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    Point, Radians, Rgba, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -58,6 +58,9 @@ pub struct Scene {
     /// 捕获发生在主 pass 之前，用同一棵场景重画到离屏纹理；请求只应由
     /// 阅读器在“页面稳定、还没开始卷”的那一帧发出。
     pub page_capture: Option<Bounds<ScaledPixels>>,
+    /// 捕获纹理首帧清屏用的颜色。捕获矩形之外必须与纸张同色：卷曲网格按窗口归一
+    /// 取 uv，落在矩形外的那一两个像素若清成透明黑，就会读成页边的一条黑带。
+    pub page_capture_clear_color: Option<Rgba>,
 }
 
 #[expect(missing_docs)]
@@ -76,6 +79,7 @@ impl Scene {
         self.surfaces.clear();
         self.page_curl_meshes.clear();
         self.page_capture = None;
+        self.page_capture_clear_color = None;
     }
 
     pub fn len(&self) -> usize {
