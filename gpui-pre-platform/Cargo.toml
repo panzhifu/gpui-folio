@@ -1,0 +1,75 @@
+[package]
+name = "gpui-pre-platform"
+version = "0.3.9"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "Zed's `gpui_platform` facade, vendored here so the HarmonyOS triple stops taking the desktop branch"
+
+# ── 这个成员为什么在这棵树里 ──────────────────────────────────────────────────
+#
+# gpui-pre-platform 是 gpui-kit 用来拿「当前平台的 Platform 实现」的那层门面，它按
+# `target_os` 分流。鸿蒙的三元组是 `aarch64-unknown-linux-ohos`，也就是
+# `target_os = "linux"` **加上** `target_env = "ohos"` —— 于是门面在鸿蒙上走的是桌面
+# 那一支，把 `gpui-pre-linux` 整条 X11 / Wayland 后端拖进依赖图；那一支的 build script
+# 会发 `-lxcb -lxkbcommon -lxkbcommon-x11`，而 OHOS 的 sysroot 里没有这些库，cdylib
+# 就在最后一步链接上失败（编译本身是全过的，所以 `cargo check` 一路绿灯，只有真链才撞）。
+#
+# 上游没法从外面绕过这一条：gpui-kit 显式开了 `gpui_platform` 的 `x11` + `wayland`
+# feature，两个 feature 直接转发到 `gpui-pre-linux`，消费侧改不动传递依赖的 feature。
+# 所以把这层门面抄进来，只改一件事 —— 桌面那一支的判据从 `target_os = "linux"` 收紧成
+# `all(target_os = "linux", not(target_env = "ohos"))`，与 iOS / Android 那两条臂对齐
+# （gpui-kit 自己也是用 `cfg(not(any(ios, android)))` 才把门面挂上去的，见
+# gpui-kit/crates/kit/Cargo.toml 的 target 段）：鸿蒙上 `gpui-pre-linux` 根本不进图。
+#
+# 除那三条 cfg 之外，源码与上游 0.3.9 那份逐字相同（zed@93d7456 的 gpui_platform 快照）。
+# 哪天上游给三元组加了 ohos 分流，整个成员连同根上那条 patch 一起删。
+
+[lib]
+name = "gpui_platform"
+path = "src/gpui_platform.rs"
+doctest = false
+
+[features]
+default = ["multithreaded"]
+multithreaded = ["gpui_web/multithreaded"]
+bench-support = ["gpui/bench-support", "gpui_macos/bench-support", "gpui_wgpu/bench-support"]
+font-kit = ["gpui_macos/font-kit"]
+inspector = ["gpui/inspector"]
+test-support = [
+    "gpui/test-support",
+    "gpui_macos/test-support",
+    "gpui_windows/test-support",
+    "gpui_wgpu/test-support",
+]
+screen-capture = [
+    "gpui/screen-capture",
+    "gpui_macos/screen-capture",
+    "gpui_windows/screen-capture",
+    "gpui_linux/screen-capture",
+]
+runtime_shaders = ["gpui_macos/runtime_shaders"]
+wayland = ["gpui_linux/wayland"]
+x11 = ["gpui_linux/x11"]
+
+[dependencies]
+anyhow = "1.0.86"
+gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_macos = { package = "gpui-pre-macos", version = "=0.3.9", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_windows = { package = "gpui-pre-windows", version = "=0.3.9", default-features = false }
+gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false, features = ["windows-manifest"] }
+
+# 桌面 linux 那两条：`not(target_env = "ohos")` 就是本成员存在的唯一理由。
+[target.'cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "freebsd"))'.dependencies]
+gpui_linux = { package = "gpui-pre-linux", version = "=0.3.9", default-features = false }
+
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.9", optional = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+gpui_web = { package = "gpui-pre-web", version = "=0.3.9", default-features = false }
+console_error_panic_hook = "0.1.7"

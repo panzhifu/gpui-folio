@@ -1,18 +1,27 @@
 [workspace]
 resolver = "2"
-members = ["gpui-pre", "gpui-pre-wgpu", "folio-curl"]
+members = ["gpui-pre", "gpui-pre-wgpu", "gpui-pre-platform", "folio-curl"]
 
-# 这棵分叉树的唯一目的：给 folio 的仿真翻页补上
+# 这棵分叉树原先只为一件事：给 folio 的仿真翻页补上
 #   - 自定义网格 primitive（页面纹理的圆柱形变）
 #   - 页面帧捕获（把当前页烘成纹理）
 #   - 阴影 pass（卷曲纸投在新页上的影子）
 #
+# 第三个成员 `gpui-pre-platform` 是后加的第二件事：让鸿蒙能链出 cdylib。鸿蒙的三元组
+# 报 `target_os = "linux"`，而那层门面按 `target_os` 选平台，于是它把桌面
+# `gpui-pre-linux`（X11 / Wayland）整条拖进图里，`-lxcb` 那些 link flag 在 OHOS 的
+# sysroot 里没有对应库 —— 编译全过、只在最后链接上撞，`cargo check` 看不出任何异常。
+# 消费侧改不动传递依赖的 feature（gpui-kit 显式开了 `gpui_platform` 的 `x11` +
+# `wayland`），所以只能把这层门面收进来改它的判据。细节写在那个成员的 Cargo.toml 顶上。
+#
 # 两个上游 crate 的包名与版本必须保持 0.3.9：folio 的 gpui-kit / gpui-mobile
 # 都精确依赖 `gpui-pre =0.3.9` / `gpui-pre-wgpu =0.3.9`，改包名或版本会让
-# 整张依赖图分出第二棵 gpui，类型对不上。
+# 整张依赖图分出第二棵 gpui，类型对不上。`gpui-pre-platform` 同理，它是被
+# `=0.3.9` 钉住的传递依赖。
 [patch.crates-io]
 gpui-pre = { path = "gpui-pre" }
 gpui-pre-wgpu = { path = "gpui-pre-wgpu" }
+gpui-pre-platform = { path = "gpui-pre-platform" }
 
 [profile.dev]
 opt-level = 0
