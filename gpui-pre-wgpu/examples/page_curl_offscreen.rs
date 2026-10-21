@@ -14,8 +14,13 @@ use gpui::{
 };
 use gpui_wgpu::WgpuHeadlessRenderer;
 
+/// 与 `folio_curl::GRID_X/Y` 同一档。
+const GRID: usize = 96;
+
 fn main() -> anyhow::Result<()> {
-    let side = 256;
+    // 512 而不是 256：网格一格 = 边长/96，边长太小台阶只有两三个像素，量不出差别。
+    let side = 512;
+    let out = std::env::args().nth(1).unwrap_or_else(|| "/tmp/page_curl_offscreen.png".into());
     let size = Size {
         width: DevicePixels(side),
         height: DevicePixels(side),
@@ -66,31 +71,44 @@ fn main() -> anyhow::Result<()> {
         bounds,
         content_mask: ContentMask { bounds },
         page_bounds: bounds,
-        vertices: Arc::from(vec![
-            PageCurlVertex {
-                position: [0.0, 0.0],
-                uv: [0.0, 0.0],
-            },
-            PageCurlVertex {
-                position: [side as f32, 0.0],
-                uv: [1.0, 0.0],
-            },
-            PageCurlVertex {
-                position: [side as f32, side as f32],
-                uv: [1.0, 1.0],
-            },
-            PageCurlVertex {
-                position: [0.0, side as f32],
-                uv: [0.0, 1.0],
-            },
-        ]),
-        indices: Arc::from(vec![0u32, 1, 2, 0, 2, 3]),
+        // 与 `folio_curl::build_page_mesh` 同一张网格：这一格的全部意义就是「折线落在三角形
+        // 内部时，边界只能对齐顶点」，四角一张面片是量不出来的。折线取斜的（43°），因为竖直
+        // 的折线恰好与网格对齐，台阶天生看不见。
+        vertices: Arc::from({
+            let mut v = Vec::with_capacity((GRID + 1) * (GRID + 1));
+            for y in 0..=GRID {
+                for x in 0..=GRID {
+                    let (u, w) = (
+                        x as f32 / GRID as f32,
+                        y as f32 / GRID as f32,
+                    );
+                    v.push(PageCurlVertex {
+                        position: [u * side as f32, w * side as f32],
+                        uv: [u, w],
+                    });
+                }
+            }
+            v
+        }),
+        indices: Arc::from({
+            let columns = (GRID + 1) as u32;
+            let mut idx = Vec::with_capacity(GRID * GRID * 6);
+            for y in 0..GRID as u32 {
+                for x in 0..GRID as u32 {
+                    let a = y * columns + x;
+                    idx.extend_from_slice(&[a, a + columns, a + 1, a + 1, a + columns, a + columns + 1]);
+                }
+            }
+            idx
+        }),
         uniforms: PageCurlUniforms {
             page_origin: [0.0, 0.0],
             page_size: [side as f32, side as f32],
             window_size: [side as f32, side as f32],
-            axis_normal: [1.0, 0.0],
-            axis_d: side as f32 * 0.9,
+            // 43°：与点屏那一笔起手同一档（`MAX_TILT`）。轴过页面中心偏左一点，让柱面与
+            // 背面那两片都落在画面里。
+            axis_normal: [0.7282, 0.6854],
+            axis_d: side as f32 * 0.62,
             radius: side as f32 * 0.1,
             camera_distance: side as f32 * 3.0,
             scale_factor: 1.0,
@@ -102,9 +120,9 @@ fn main() -> anyhow::Result<()> {
 
     let mut renderer = WgpuHeadlessRenderer::new()?;
     let image = renderer.render_to_image(&scene, size)?;
-    image.save("/tmp/page_curl_offscreen.png")?;
+    image.save(&out)?;
     println!(
-        "wrote /tmp/page_curl_offscreen.png ({}x{})",
+        "wrote {out} ({}x{})",
         image.width(),
         image.height()
     );

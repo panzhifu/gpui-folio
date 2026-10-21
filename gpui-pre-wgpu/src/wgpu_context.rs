@@ -467,9 +467,18 @@ impl WgpuContext {
                 .using_alignment(adapter.limits())
         };
         #[cfg(not(target_family = "wasm"))]
-        let required_limits = wgpu::Limits::downlevel_defaults()
-            .using_resolution(adapter.limits())
-            .using_alignment(adapter.limits());
+        // `downlevel_defaults()` 从 `default()` 继承一整套高值，而 GLES 适配器把
+        // compute 与 storage buffer **两族整族报成 0**；后面那两个 `using_*` 只夹分辨率
+        // 与对齐，于是 `request_device` 逐条校验失败，一个 adapter 都留不下
+        // （鸿蒙模拟器实测，三条依次冒出来）：
+        //   Limit 'max_compute_workgroups_per_dimension' value 65535     is better than allowed 0
+        //   Limit 'max_compute_workgroup_size_z'         value 64        is better than allowed 0
+        //   Limit 'max_storage_buffer_binding_size'      value 134217728 is better than allowed 0
+        // 逐族夹是打地鼠（`Limits` 有 51 格，一半还是实验性的），直接按适配器报的那一份
+        // 要 —— 那本来就是设备上界，也是 wgpu 文档推荐的写法。
+        // wasm 那一支不动：`downlevel_webgl2_defaults()` 自己就把 compute 归零了。
+        #[cfg(not(target_family = "wasm"))]
+        let required_limits = adapter.limits();
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {

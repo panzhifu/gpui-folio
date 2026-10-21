@@ -168,55 +168,72 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv_min = (curl.capture_origin + vec2<f32>(0.5)) / curl.window_size;
     let uv_max = (curl.capture_origin + curl.page_size - vec2<f32>(0.5)) / curl.window_size;
     let capture_uv = clamp(in.uv, uv_min, uv_max);
-    // 先在分支外采一次：这一趟是全场唯一一次读那张纹理，平摊与卷曲两段共用。
+    // 全场唯一一次正面采样。
     let paper = textureSampleLevel(capture_texture, capture_sampler, capture_uv, 0.0).rgb;
 
-    if (in.past <= 0.0) {
-        // 平摊那一片就是页面本身。参照实现不在平摊纸上画投影；投影是卷筒在下面那张
-        // 新页上的一道独立影。这里若乘一个 `1 - ink`，整条纸边都会罩一层浅灰。
+    // **这一格是整段的关键**：`past` 不用顶点传进来的那一份，而是从 `uv` 现算。
+    //
+    // 顶点插值出来的 `past` 与 `normal`，等值线只能对齐网格顶点 —— 网格一格 = 页宽/96 ≈
+    // 手机上 11 个物理像素，于是斜着的接缝在屏上是一格一格的台阶（真机量到过，读者报的
+    // 「右下角跳动」里空间那一半就是它）。而 `uv` 是材质坐标，它在三角形内线性插值出来的
+    // 就是那一点本身：`n·(uv·页尺寸·缩放) − d0` 逐像素精确，等值线是一条**解析直线**。
+    // 顺带法向也不用插值了 —— 卷成柱面那一段的法向由 `θ = past / R` 完全决定。
+    let local = in.uv * curl.page_size * curl.scale_factor;
+    let r = max(curl.radius, 0.001);
+    let past = dot(curl.axis_normal, local) - curl.axis_d;
+    let theta = past / r;
+    // 带宽 = 这一像素跨过的距离。硬边之所以难看不是因为它硬，是因为它走的是台阶；台阶换成
+    // 直线之后，一到两个像素的过渡就够把剩下的锯齿吃掉。
+    let w = max(fwidth(past), 1e-4);
+
+    if (past <= -w) {
+        // 平摊那一片就是页面本身，一个字都不调：绝大多数像素走这一条，一次采样就够。
+        // 参照实现也不在平摊纸上画投影；投影是卷筒自己的事，乘到这里就成了整条纸边罩灰。
         return vec4<f32>(paper, 1.0);
     }
 
-    let n = normalize(in.normal);
+    // 柱面那一段的法向：绕着折线转过 θ，正对读者是 θ = 0，与视线齐平是 θ = π/2。
+    let n = vec3<f32>(curl.axis_normal * sin(theta), cos(theta));
     let light = normalize(curl.light_dir.xyz);
     let diffuse = max(dot(n, light), 0.0);
     let light_z = max(light.z, 0.001);
     // 卷曲段上走过的归一化弧长：0 = 贴着折线，0.5 = 柱顶，1 = 绕过柱顶落到背面。
-    let roll = clamp(in.past / (PI * max(curl.radius, 0.001)), 0.0, 1.0);
-    var base: vec3<f32>;
-    var brightness: f32;
-    // 正反面按法线判，不信 winding：平摊段的三角绕序在 NDC 翻 y 之后可能被当成背面，
-    // 那样整页正文会读成空白纸背。
-    if (n.z >= 0.0) {
-        base = paper;
-        // 柱顶那道**亮脊**是「纸有厚度」的主要线索，往两端收回到纸色，与平摊那一段接缝不跳。
-        // 从前这里主项取 N·L，而 `light_dir` 主要沿视线 —— 柱顶那一点法向与视线垂直，亮度
-        // 反而掉到 0.69，真机上量到的是卷曲带比纸面还暗（207→192 那个下凹）：受光装反了。
-        // N·L 现在只留一点点调制。
-        let crest = sin(roll * PI);
-        brightness = 1.0 + 0.10 * crest + 0.05 * (diffuse / light_z - 1.0) * (1.0 - crest);
-    } else {
-        // 背面 = 接近纸白 + **对面那一版字透过来**，再只在贴着柱顶那一窄条压一道内侧影。参照里
-        // 那句「整片 ×0.92、内侧再 ×0.82」在真机上量到 192 / 235 两档，摊开成一条三百多像素的
-        // 灰带 —— 读者报的「黑条」就是它。这里底提到 0.94，让那道影在六分之一段内就走完，读出来
-        // 是一条接触线而不是一条带。
-        //
-        // 透墨那一次采的是**同一张**捕获纹理，只是把材质坐标沿页的中线左右镜像（背面看到的字
-        // 本来就是反的）：不新增 uniform、不新增 pass，只在背面那几片多一次采样。镜像后的坐标
-        // 恒落在 `[0, 页宽]` 里 ⇒ 采不到捕获矩形的外圈 —— 那一圈没被写过，采到就是黑。
-        let local = capture_uv * curl.window_size - curl.capture_origin;
-        let ghost_uv =
-            (curl.capture_origin + vec2<f32>(curl.page_size.x - local.x, local.y)) / curl.window_size;
-        let ghost = textureSampleLevel(
-            capture_texture,
-            capture_sampler,
-            clamp(ghost_uv, uv_min, uv_max),
-            0.0,
-        ).rgb;
-        base = mix(curl.back_color.rgb, ghost, BACK_INK);
-        brightness = mix(0.94, 1.0, min(in.back_fade * 6.0, 1.0));
-    }
-    // 纸边：最外 2px 抬一点白，读成纸有自己的厚度，而不是一刀切的贴图边界。
-    let edge = 1.0 - smoothstep(0.0, 2.0, in.edge);
-    return vec4<f32>(base * brightness + vec3<f32>(0.06 * edge), 1.0);
+    let roll = clamp(past / (PI * r), 0.0, 1.0);
+    // 柱顶那道**亮脊**是「纸有厚度」的主要线索，往两端收回到纸色，与平摊那一段接缝不跳。
+    // 从前这里主项取 N·L，而 `light_dir` 主要沿视线 —— 柱顶那一点法向与视线垂直，亮度
+    // 反而掉到 0.69，真机上量到的是卷曲带比纸面还暗（207→192 那个下凹）：受光装反了。
+    // N·L 现在只留一点点调制。
+    let crest = sin(roll * PI);
+    let front = paper * (1.0 + 0.10 * crest + 0.05 * (diffuse / light_z - 1.0) * (1.0 - crest));
+
+    // 背面 = 接近纸白 + **对面那一版字透过来**，再只在贴着柱顶那一窄条压一道内侧影。参照里
+    // 那句「整片 ×0.92、内侧再 ×0.82」在真机上量到 192 / 235 两档，摊开成一条三百多像素的
+    // 灰带 —— 读者报的「黑条」就是它。这里底提到 0.94，让那道影在六分之一段内就走完，读出来
+    // 是一条接触线而不是一条带。
+    //
+    // 透墨那一次采的是**同一张**捕获纹理，只是把材质坐标沿页的中线左右镜像（背面看到的字
+    // 本来就是反的）：不新增 uniform、不新增 pass，只在背面那几片多一次采样。镜像后的坐标
+    // 恒落在 `[0, 页宽]` 里 ⇒ 采不到捕获矩形的外圈 —— 那一圈没被写过，采到就是黑。
+    let material = in.uv * curl.page_size;
+    let ghost_uv =
+        (curl.capture_origin + vec2<f32>(curl.page_size.x - material.x, material.y)) / curl.window_size;
+    let ghost = textureSampleLevel(
+        capture_texture,
+        capture_sampler,
+        clamp(ghost_uv, uv_min, uv_max),
+        0.0,
+    ).rgb;
+    let back_fade = clamp((theta - PI) / 1.5, 0.0, 1.0);
+    let back = mix(curl.back_color.rgb, ghost, BACK_INK)
+        * mix(0.94, 1.0, min(back_fade * 6.0, 1.0));
+
+    // 正面 ↔ 背面：纸绕过柱顶转过去的那一瞬（θ = π/2，即 `past = πR/2`）法向过零。从前这里
+    // 是 `n.z >= 0` 一刀切 —— 判据本身没错，错在它读的是插值法向，于是那条线落在网格上就是
+    // 台阶。读现算的 `past`，它就是一条解析直线，两像素的过渡把剩下的锯齿吃掉。
+    let turn = PI * r * 0.5;   // 过这一点纸转到背面：`side` 随 past 增大而**减小**
+    let side = clamp(0.5 + (turn - past) / (2.0 * w), 0.0, 1.0);
+    let curled = mix(back, front, side);
+    // 平摊 ↔ 卷起：位置在这里连续（`u` 两侧都等于 `past`），换的只有受光与内容那一档。
+    let rim = vec3<f32>(0.06 * (1.0 - smoothstep(0.0, 2.0, in.edge)));
+    return vec4<f32>(mix(paper, curled + rim, smoothstep(-w, w, past)), 1.0);
 }
