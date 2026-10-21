@@ -88,6 +88,21 @@ pub enum WgpuBackend {
     Native(wgpu::Backend),
 }
 
+impl WgpuBackend {
+    /// Any OpenGL-shaped backend.
+    ///
+    /// `Gl` is what the wasm build selects; a GLES device on a native target arrives
+    /// as `Native(Backend::Gl)`, so code that means "the GL driver, wherever it came
+    /// from" has to ask both.
+    pub fn is_gl(self) -> bool {
+        match self {
+            Self::Gl => true,
+            Self::Native(backend) => backend == wgpu::Backend::Gl,
+            Self::BrowserWebGpu => false,
+        }
+    }
+}
+
 #[cfg(target_family = "wasm")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum WebBackendPreference {
@@ -755,8 +770,26 @@ impl WgpuContext {
         self.backend
     }
 
+    /// Whether instance data travels through a texture instead of a storage buffer.
+    ///
+    /// WebGL2 has no SSBOs — and neither does a plain GLES 3.0 driver. wgpu-core
+    /// refuses a `BufferBindingType::Storage` entry visible to the vertex stage
+    /// unless `DownlevelFlags::VERTEX_STORAGE` is set, which is exactly the case on
+    /// the HarmonyOS emulator (its GLES reports `storage_buffers_per_stage = 0`), so
+    /// asking the adapter rather than the target family is what turns "no adapter
+    /// can configure this surface" into a drawn frame. A GL device that *does* have
+    /// vertex storage keeps the buffer path, so this changes nothing on Android or on
+    /// the wasm build's WebGPU path.
     pub fn uses_webgl_instance_data(&self) -> bool {
-        matches!(self.backend, WgpuBackend::Gl) && cfg!(target_family = "wasm")
+        if !self.backend.is_gl() {
+            return false;
+        }
+        cfg!(target_family = "wasm")
+            || !self
+                .adapter
+                .get_downlevel_capabilities()
+                .flags
+                .contains(wgpu::DownlevelFlags::VERTEX_STORAGE)
     }
 
     pub fn supports_dual_source_blending(&self) -> bool {
