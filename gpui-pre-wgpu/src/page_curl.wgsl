@@ -76,12 +76,21 @@ struct CurlUniforms {
 @group(4) @binding(1) var back_sampler: sampler;
 
 const PI: f32 = 3.141592653589793;
-const SHADOW_BIAS: f32 = 0.0015;
+/// 阴影比较的偏置。颜色目标是 8 位，一档 = 1/255 ≈ 0.0039；偏置小于半档时，平面与
+/// 自己比就会被量化误差判成「在影里」（自阴影噪点）。取一档多一点：纸抬起来那一段
+/// 的深度差约 0.03，还远远吃得下。
+const SHADOW_BIAS: f32 = 0.0045;
 
 /// 卷面根部的压暗深度：纸刚离开页面那一段最暗，往柱顶一路收回纸色原样。
 ///
 /// 这是**卷面自己的**接触暗部；平摊页上的投影由下面的 shadow map 给，不在这里乘进去。
 const ROOT_SHADE: f32 = 0.18;
+
+/// 背面透墨的浓度：`0` = 纯纸白，`1` = 把正面照抄到背面。
+///
+/// 取 0.22：61 号字在白纸上约 0.05，透出来约 0.75 —— 真书上逆光看薄纸的那一档；再淡就没
+/// 有人能看出这是同一页的字，再浓就成了把正面的字直接印在背面。
+const BLEED: f32 = 0.34;
 
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -218,9 +227,16 @@ fn vs_shadow(input: VertexInput) -> ShadowOutput {
     return out;
 }
 
+struct ShadowFragment {
+    @location(0) color: vec4<f32>,
+    /// 同时写进深度附件：颜色目标是 8 位、又不保证三角形从近到远，只有让深度测试
+    /// 用同一个数，颜色里留下的才是「离光源最近」的那一个（后画的近处纸能盖掉远处）。
+    @builtin(frag_depth) depth: f32,
+}
+
 @fragment
-fn fs_shadow(in: ShadowOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.depth, 0.0, 0.0, 1.0);
+fn fs_shadow(in: ShadowOutput) -> ShadowFragment {
+    return ShadowFragment(vec4<f32>(in.depth, 0.0, 0.0, 1.0), in.depth);
 }
 
 /// 3×3 PCF：`0` = 完全在影里，`1` = 完全受光。
@@ -272,10 +288,15 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let shadow = sample_shadow(in.light_pos);
     if (past <= -w) {
-        // 平摊那一片：页面本身乘上 shadow map 的投影。折痕处纸还贴着页（`z = 0`），
-        // 影是卷起来那一片投下来的，不是给整条纸边罩灰 —— 旧的 `0.5R` 窄带已经删掉，
-        // 现在由深度图决定落点与软硬。
-        return vec4<f32>(paper * mix(0.62, 1.0, shadow), 1.0);
+        // 平摊那一片：贴折痕一条**软渐变**。参照 Reeden 的仿真翻页：影子是「折痕旁边
+        // 由深到浅的一条带」，宽度约页宽的一成、最深处约 0.84 纸色（真机量到 213/255），
+        // 而不是按投影几何算出来的窄硬边（那张 shadow map 更适合给卷面自己用）。
+        //
+        // 带子从折痕往外铺 `page_size.x * 0.10`；`smoothstep` 让两端都不出硬边。
+        let band = clamp(-past / max(curl.page_size.x * 0.10, 1.0), 0.0, 1.0);
+        let fold_shadow = mix(0.84, 1.0, smoothstep(0.0, 1.0, band));
+        // shadow map 只留一点调制（卷筒投下的那一层），不叠加成第二条深带。
+        return vec4<f32>(paper * fold_shadow * mix(0.94, 1.0, shadow), 1.0);
     }
 
     // 卷面法向：圆柱那一条是 `(n·sinθ, cosθ)`；圆锥的半径沿折痕变化，法向还要沿切向
@@ -310,28 +331,28 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
     let front = paper * (1.0 + 0.10 * crest + 0.05 * (diffuse / light_z - 1.0) * (1.0 - crest)
         - root);
 
-    // 背面 = 接近纸白 + **对面那一版字透过来**，再只在贴着柱顶那一窄条压一道内侧影。参照里
-    // 那句「整片 ×0.92、内侧再 ×0.82」在真机上量到 192 / 235 两档，摊开成一条三百多像素的
-    // 灰带 —— 读者报的「黑条」就是它。这里底提到 0.94，让那道影在六分之一段内就走完，读出来
-    // 是一条接触线而不是一条带。
+    // 背面 = 接近纸白 + **正面这一页的墨透过来**，再只在贴着柱顶那一窄条压一道内侧影。
+    // 参照里那句「整片 ×0.92、内侧再 ×0.82」在真机上量到 192 / 235 两档，摊开成一条三百多
+    // 像素的灰带 —— 读者报的「黑条」就是它。这里底提到 0.94，让那道影在六分之一段内就走完，
+    // 读出来是一条接触线而不是一条带。
     //
-    // 背面采的是**下一跨页的另一半**（捕获层 2），不是正面镜像透墨。纸翻过去后背面看到的
-    // 字与正面左右相反，所以材质 U 取镜像；镜像后的坐标仍落在捕获矩形里。
+    // 背面不是下一页：读者翻起来的是一张纸，反面看到的是**同一页正面的字透过来**。
+    // 采的仍是正面那张捕获纹理，而且**材质坐标不再镜像**：纸绕过柱顶之后，背面那一片的
+    // 几何本身已经把材质投成镜像了（`u = πR − d`，d 越大屏上越往回收）。在几何的镜像上
+    // 再对 U 取一次反，两次抵消，读出来是正着的字 —— 真机上看到的就是这个。这里直接按
+    // 材质坐标采，屏上才是左右相反的透墨。浓度取 `BLEED`（纸色不动、墨变成深灰），
+    // 相当于薄纸逆光看的效果。
     let material = in.material * curl.page_size;
-    let back_uv = (curl.back_capture_origin
-        + vec2<f32>(curl.page_size.x - material.x, material.y))
-        / curl.window_size;
-    let back_min = (curl.back_capture_origin + vec2<f32>(0.5)) / curl.window_size;
-    let back_max =
-        (curl.back_capture_origin + curl.page_size - vec2<f32>(0.5)) / curl.window_size;
-    let back_paper = textureSampleLevel(
-        back_texture,
-        back_sampler,
-        clamp(back_uv, back_min, back_max),
+    let bleed_uv = (curl.capture_origin + material) / curl.window_size;
+    let bleed = textureSampleLevel(
+        capture_texture,
+        capture_sampler,
+        clamp(bleed_uv, uv_min, uv_max),
         0.0,
     ).rgb;
     let back_fade = clamp((theta - PI) / 1.5, 0.0, 1.0);
-    let back = back_paper * mix(0.94, 1.0, min(back_fade * 6.0, 1.0));
+    let back = (curl.back_color.rgb + (bleed - curl.back_color.rgb) * BLEED)
+        * mix(0.985, 1.0, min(back_fade * 6.0, 1.0));
 
     // 正面 ↔ 背面：纸绕过柱顶转过去的那一瞬（θ = π/2，即 `past = πR/2`）法向过零。从前这里
     // 是 `n.z >= 0` 一刀切 —— 判据本身没错，错在它读的是插值法向，于是那条线落在网格上就是
@@ -343,7 +364,9 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
     let rim = vec3<f32>(0.06 * (1.0 - smoothstep(0.0, 2.0, in.edge)));
     // 卷面自己也在 shadow map 里：抬得越高、越靠近另一页，越暗。平摊那一侧用同一个
     // shadow 采样（`0.62` 的底部比卷面深一点，影落在纸上比落在纸上再落影更重）。
-    let lit = (curled + rim) * mix(0.78, 1.0, shadow);
-    let flat = paper * mix(0.62, 1.0, shadow);
+    // 卷面自己也被 shadow map 压：抬得越高、越靠近另一页，越暗。压得很浅（0.94），
+    // 免得读成「阴影盖在纸上面」—— 卷面的明暗主要交给 `crest` / `root` 那一套。
+    let lit = (curled + rim) * mix(0.94, 1.0, shadow);
+    let flat = paper * mix(0.86, 1.0, shadow);
     return vec4<f32>(mix(flat, lit, smoothstep(-w, w, past)), 1.0);
 }

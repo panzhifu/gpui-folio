@@ -185,12 +185,26 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// 切捕获层，并把这一步记进 paint 操作流。
+    ///
+    /// 记进流是必须的，不是记账好看：gpui 有两条路会**跳过元素的 `paint`**而只重放上一帧
+    /// 记录的 `paint_operations`（视图没被 notify 时的 `reuse_paint`、`paint_deferred_draws`
+    /// 里 `element` 为 `None` 的那一支）。层号若只是场景上的一个字段，重放时读到的就是重放
+    /// 那一刻的环境（主场景 = `0`），本该排进捕获高段的 primitive 会被重新编号排进主 pass ——
+    /// 症状是捕获层里那一页副本直接上屏，与正文叠成两页字。
+    pub fn set_capture_layer(&mut self, layer: u8) {
+        self.capture_layer = layer;
+        self.paint_operations
+            .push(PaintOperation::SetCaptureLayer(layer));
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::SetCaptureLayer(layer) => self.set_capture_layer(*layer),
             }
         }
     }
@@ -273,6 +287,7 @@ pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    SetCaptureLayer(u8),
 }
 
 #[derive(Clone)]
@@ -354,12 +369,18 @@ impl<'a> Iterator for BatchIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         // 把不在本层区间里的 primitive 全部跳过去；主 pass 与捕获 pass 各拿一段 order。
+        //
+        // **跳过时 `*_start` 也必须跟着走**：那几格才是批次区间（也就是 instance 数据里
+        // 从哪一条开始画）的唯一来源。只推进迭代器不让 start 跟着走，捕获 pass 拿到的区间
+        // 就会落在跳过的那些主场景 primitive 上 —— 卷起来那页纸采到的是主场景的字（还会把
+        // 底下的书架/详情页一起卷进去），而捕获层里自己那 320 条一条都没画。
         while self
             .shadows_iter
             .peek()
             .is_some_and(|item| !self.range.contains(&item.order))
         {
             self.shadows_iter.next();
+            self.shadows_start += 1;
         }
         while self
             .quads_iter
@@ -367,6 +388,7 @@ impl<'a> Iterator for BatchIterator<'a> {
             .is_some_and(|item| !self.range.contains(&item.order))
         {
             self.quads_iter.next();
+            self.quads_start += 1;
         }
         while self
             .paths_iter
@@ -374,6 +396,7 @@ impl<'a> Iterator for BatchIterator<'a> {
             .is_some_and(|item| !self.range.contains(&item.order))
         {
             self.paths_iter.next();
+            self.paths_start += 1;
         }
         while self
             .underlines_iter
@@ -381,6 +404,7 @@ impl<'a> Iterator for BatchIterator<'a> {
             .is_some_and(|item| !self.range.contains(&item.order))
         {
             self.underlines_iter.next();
+            self.underlines_start += 1;
         }
         while self
             .monochrome_sprites_iter
@@ -388,6 +412,7 @@ impl<'a> Iterator for BatchIterator<'a> {
             .is_some_and(|item| !self.range.contains(&item.order))
         {
             self.monochrome_sprites_iter.next();
+            self.monochrome_sprites_start += 1;
         }
         while self
             .subpixel_sprites_iter
@@ -395,6 +420,7 @@ impl<'a> Iterator for BatchIterator<'a> {
             .is_some_and(|item| !self.range.contains(&item.order))
         {
             self.subpixel_sprites_iter.next();
+            self.subpixel_sprites_start += 1;
         }
         while self
             .polychrome_sprites_iter
@@ -402,6 +428,7 @@ impl<'a> Iterator for BatchIterator<'a> {
             .is_some_and(|item| !self.range.contains(&item.order))
         {
             self.polychrome_sprites_iter.next();
+            self.polychrome_sprites_start += 1;
         }
         while self
             .surfaces_iter
@@ -409,6 +436,7 @@ impl<'a> Iterator for BatchIterator<'a> {
             .is_some_and(|item| !self.range.contains(&item.order))
         {
             self.surfaces_iter.next();
+            self.surfaces_start += 1;
         }
         while self
             .page_curl_meshes_iter
@@ -416,6 +444,7 @@ impl<'a> Iterator for BatchIterator<'a> {
             .is_some_and(|item| !self.range.contains(&item.order))
         {
             self.page_curl_meshes_iter.next();
+            self.page_curl_meshes_start += 1;
         }
         let mut orders_and_kinds = [
             (

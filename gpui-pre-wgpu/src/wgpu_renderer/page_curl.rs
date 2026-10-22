@@ -17,6 +17,16 @@ const PAGE_CURL_SHADERS: &str = include_str!("../page_curl.wgsl");
 /// 是 3×3 PCF 里一个纹素更细，肉眼分不出。
 const SHADOW_MAP_SIZE: u32 = 1024;
 
+/// 与 `page_curl.wgsl` 的 `CurlUniforms` 一一对上。尺寸与那三格关键偏移都要一致：错一位**不
+/// 报错**，只是阴影矩阵与两张捕获纹理的采样原点各读到隔壁那格的去向。
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<GpuCurlUniforms>() == 240);
+    assert!(offset_of!(GpuCurlUniforms, shadow_map_size) == 128);
+    assert!(offset_of!(GpuCurlUniforms, light_view_proj) == 160);
+    assert!(offset_of!(GpuCurlUniforms, back_capture_origin) == 224);
+};
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuCurlUniforms {
@@ -35,7 +45,13 @@ struct GpuCurlUniforms {
     capture_origin: [f32; 2],
     _padding: [f32; 2],
     shadow_map_size: f32,
+    /// WGSL 那边 `vec3` 与 `mat4x4` 都按 **16** 字节对齐，而 Rust 这边全是 `f32` 数组（按 4
+    /// 排）。这两格是把 shader 那侧的隐式空洞显式补回来：少了它们，`_pad1` 起往后每一格都
+    /// 错位 12–16 字节，而 Vulkan 会直接以「shader 要 240、布局只给 224」拒掉整条
+    /// `page_curl_mesh` 管线 —— 真机上读起来是应用卡在启动画面，一行渲染都出不去。
+    _pad0: [f32; 3],
     _pad1: [f32; 3],
+    _pad1a: f32,
     light_view_proj: [[f32; 4]; 4],
     back_capture_origin: [f32; 2],
     _pad2: [f32; 2],
@@ -59,7 +75,9 @@ impl GpuCurlUniforms {
             capture_origin: uniforms.capture_origin,
             _padding: [0.0; 2],
             shadow_map_size: SHADOW_MAP_SIZE as f32,
+            _pad0: [0.0; 3],
             _pad1: [0.0; 3],
+            _pad1a: 0.0,
             light_view_proj,
             back_capture_origin: uniforms.back_capture_origin,
             _pad2: [0.0; 2],
@@ -199,12 +217,15 @@ pub(super) fn create_pipelines(
         "page_curl_shadow",
         "vs_shadow",
         "fs_shadow",
-        &[
-            Some(&layouts.globals),
-            Some(&layouts.page_curl_uniforms),
-        ],
+        &[Some(&layouts.globals), Some(&layouts.page_curl_uniforms)],
         wgpu::TextureFormat::Rgba8Unorm,
-        None,
+        Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
         None,
     );
 
@@ -228,6 +249,11 @@ struct ShadowTexture {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
+    /// 深度测试用的那一张：shadow map 的颜色目标是 8 位，光栅顺序又不保证从近到远，
+    /// 没有深度测试时后画的三角形会盖掉先画的那个深度 —— 图里存的是「最后一个」而不是
+    /// 「最近的一个」。有了它，颜色目标里留下的才是离光源最近的表面。
+    _depth: wgpu::Texture,
+    depth_view: wgpu::TextureView,
 }
 
 struct FrameDraw {
@@ -398,6 +424,21 @@ impl PageCurlResources {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("page_curl_shadow_depth"),
+            size: wgpu::Extent3d {
+                width: SHADOW_MAP_SIZE,
+                height: SHADOW_MAP_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("page_curl_shadow_bind_group"),
             layout: &layouts.texture,
@@ -416,6 +457,8 @@ impl PageCurlResources {
             _texture: texture,
             view,
             bind_group,
+            _depth: depth,
+            depth_view,
         });
     }
 
@@ -443,7 +486,15 @@ impl PageCurlResources {
                 },
                 depth_slice: None,
             })],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &shadow.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    // 这一趟的深度只在它自己内部比先后，出去没人再读。
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
             ..Default::default()
         });
         pass.set_pipeline(&self.pipelines.shadow);
@@ -758,13 +809,17 @@ fn light_view_proj(uniforms: &PageCurlUniforms) -> Mat4 {
         [0.0, 1.0, 0.0]
     };
     let extent = diagonal * 0.65 + uniforms.radius * 2.5 + 8.0;
+    // 视图空间的 z 在标准 look-at 下是**负的**（点在相机前方），而 `ortho` 把 `[near, far]`
+    // 线性映到 `[0, 1]`。照正数代进去，整页 z ≈ −distance 落在近平面之外，shadow pass 的
+    // 三角形全被裁掉、图里只剩清屏色，主片那边 `ndc.z > stored + bias` 永远为假 —— 真机上
+    // 就是「翻页一点阴影都没有」。两端取负，`[-0.1, -(2d+4R)]` 才是这一段正确的深度区间。
     let projection = ortho(
         -extent,
         extent,
         -extent,
         extent,
-        0.1,
-        distance * 2.0 + uniforms.radius * 4.0,
+        -0.1,
+        -(distance * 2.0 + uniforms.radius * 4.0),
     );
     mul(projection, look_at(eye, center, up))
 }

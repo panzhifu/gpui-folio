@@ -3950,6 +3950,17 @@ impl Window {
         let mut deferred_draws = mem::take(&mut self.next_frame.deferred_draws);
         for deferred_draw_ix in traversal_order {
             let mut deferred_draw = &mut deferred_draws[deferred_draw_ix];
+            // 捕获层的开关只在**一次绘制的跨度**里有效，而每一条 deferred 绘制各自是一个跨度。
+            // 一道闸与它管的那段内容可能落在不同的条目里（也可能整段走 `reuse_paint` 重放），
+            // 于是上一条目结束时残留的层号会把接下来每一条 deferred 内容 —— 别的屏的浮层、
+            // 面板 —— 一并排进捕获段：主 pass 不画它，捕获 pass 却画它，读起来就是别的屏的字
+            // 跟着这一页一起卷。真带子的那两道闸记在操作流里（见 `Scene::set_capture_layer`），
+            // 重放时会自己重新开合，所以先回主场景不会把页副本错画到屏上。
+            debug_assert_eq!(
+                self.next_frame.scene.capture_layer, 0,
+                "带着没关掉的捕获层进 deferred 绘制"
+            );
+            self.next_frame.scene.capture_layer = 0;
             self.element_id_stack
                 .clone_from(&deferred_draw.element_id_stack);
             self.next_frame
@@ -4863,8 +4874,11 @@ impl Window {
 
     /// 绘制回调里切捕获层：之后的 primitive 排到 `layer` 的高 order 段，主 pass 跳过。
     /// `0` = 回到主场景。调用方必须在同一次绘制里切回 `0`，否则后续内容全被藏起来。
+    ///
+    /// 这一步同时记进 `paint_operations`，所以被重放（`reuse_paint`）的那一段仍然带着
+    /// 自己那两道闸，见 [`Scene::set_capture_layer`]。
     pub fn set_capture_layer(&mut self, layer: u8) {
-        self.next_frame.scene.capture_layer = layer;
+        self.next_frame.scene.set_capture_layer(layer);
     }
 
     /// 这一帧此刻正画进哪一层捕获（`0` = 主场景）。
