@@ -4867,6 +4867,14 @@ impl Window {
         self.next_frame.scene.capture_layer = layer;
     }
 
+    /// 这一帧此刻正画进哪一层捕获（`0` = 主场景）。
+    ///
+    /// 给夹着捕获层画内容的那一头自检用：切进去、画完、切回来，三步里少一步都不会报错，
+    /// 只会让后续内容整片消失（order 落到捕获段，主 pass 跳过），所以要在画完那一步读回来。
+    pub fn capture_layer(&self) -> u8 {
+        self.next_frame.scene.capture_layer
+    }
+
     /// Paint an underline into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.

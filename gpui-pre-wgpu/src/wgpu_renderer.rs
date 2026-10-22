@@ -1598,10 +1598,10 @@ impl WgpuRendererCore {
                 capture_clear,
                 scissor_for(bounds, size),
                 true,
-                // 真实背页的捕获层 2 还没接；先用主层把当前页烘进背面纹理，
-                // shader 仍按镜像采样，读起来与旧的透墨接近。接上 capture layer 后
-                // 改成 `gpui::capture_order_range(2)`。
-                0..gpui::CAPTURE_ORDER_BASE,
+                // 背面那一页由 app 画进捕获层 2（`Window::set_capture_layer(2)`）：双页是
+                // 目标跨页的另一半，单页是目标页整张。层里没内容时这一趟只把纹理清成纸色，
+                // 于是背页排不出来（跨章还没排版）那一帧是一张干净的纸，不是上一趟的字。
+                gpui::capture_order_range(2),
                 &instance_bindings,
                 &mut instance_offset,
             )?;
