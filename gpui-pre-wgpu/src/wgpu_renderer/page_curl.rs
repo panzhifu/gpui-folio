@@ -27,6 +27,8 @@ struct GpuCurlUniforms {
     scale_factor: f32,
     back_color: [f32; 4],
     light_dir: [f32; 4],
+    cone_a: [f32; 4],
+    cone_b: [f32; 4],
     capture_origin: [f32; 2],
     _padding: [f32; 2],
 }
@@ -44,6 +46,8 @@ impl GpuCurlUniforms {
             scale_factor: uniforms.scale_factor,
             back_color: uniforms.back_color,
             light_dir: uniforms.light_dir,
+            cone_a: uniforms.cone_a,
+            cone_b: uniforms.cone_b,
             capture_origin: uniforms.capture_origin,
             _padding: [0.0; 2],
         }

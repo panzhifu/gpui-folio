@@ -4801,6 +4801,11 @@ impl Window {
         uniforms.axis_d *= scale_factor;
         uniforms.radius *= scale_factor;
         uniforms.camera_distance *= scale_factor;
+        // 圆锥的两端与半径都是页面局部长度；权重（`cone_a[2]`）无量纲，不乘。
+        uniforms.cone_a[0] *= scale_factor;
+        uniforms.cone_a[1] *= scale_factor;
+        uniforms.cone_a[3] *= scale_factor;
+        uniforms.cone_b[0] *= scale_factor;
         uniforms.scale_factor = scale_factor;
 
         self.next_frame

@@ -44,6 +44,10 @@ struct CurlUniforms {
     scale_factor: f32,
     back_color: vec4<f32>,
     light_dir: vec4<f32>,
+    /// 圆锥：`[锥顶切向坐标, 自由边切向坐标, 权重, 最小半径]`。
+    cone_a: vec4<f32>,
+    /// `[最大半径, 0, 0, 0]`。
+    cone_b: vec4<f32>,
     /// **烘那张纹理那一刻**页面左上角（设备像素）。取 uv 用它，摆几何用 `page_origin`：
     /// 阅读层在动（进出书的滑动、面板、尺寸变化）时这两个不是同一个数，而纹理里被写过的
     /// 只有烘的那一刻那一块 —— 混用就会采到未写区域（读成黑带）。
@@ -115,11 +119,26 @@ fn to_device_position(position: vec2<f32>, depth: f32) -> vec4<f32> {
     return vec4<f32>(ndc, depth, 1.0);
 }
 
+/// 折痕切向坐标 `s` 处的卷径：`cone_weight = 0` 时就是 `radius`（圆柱），否则半径从
+/// 书脊上的锥顶 0 线性长到自由边的 `radius`。CPU 那头的 `Cylinder::radius_at` 是同一条式子。
+fn radius_at(p: vec2<f32>) -> f32 {
+    let n = curl.axis_normal;
+    let tangent = vec2<f32>(-n.y, n.x);
+    let s = dot(tangent, p);
+    let denom = curl.cone_a.y - curl.cone_a.x;
+    let cone = clamp(
+        curl.radius * (s - curl.cone_a.x) / select(1.0, denom, abs(denom) > 1.0),
+        curl.cone_a.w,
+        curl.cone_b.x,
+    );
+    return max(mix(curl.radius, cone, clamp(curl.cone_a.z, 0.0, 1.0)), 0.001);
+}
+
 fn deform(page_position: vec2<f32>) -> Deformed {
     let p = page_position * curl.scale_factor;
     let n = curl.axis_normal;
     let d = dot(n, p) - curl.axis_d;
-    let r = max(curl.radius, 0.001);
+    let r = radius_at(p);
 
     var u: f32;
     var z: f32;
@@ -192,7 +211,7 @@ fn vs_page_curl(input: VertexInput) -> VertexOutput {
 @vertex
 fn vs_page_curl_shadow(input: VertexInput) -> VertexOutput {
     let def = deform(input.position);
-    let r = max(curl.radius, 0.001);
+    let r = radius_at(input.position * curl.scale_factor);
     let lift = def.position.z;
     var out: VertexOutput;
     out.position = to_device_position(
@@ -232,7 +251,8 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
     // 就是那一点本身：`n·(材质·页尺寸) − d0` 逐像素精确，等值线是一条**解析直线**。
     // 顺带法向也不用插值了 —— 卷成柱面那一段的法向由 `θ = past / R` 完全决定。
     let local = in.material * curl.page_size;
-    let r = max(curl.radius, 0.001);
+    // 圆锥的半径沿折痕变化，必须像 `past` 一样逐像素现算；拿顶点插值会在斜折痕上出台阶。
+    let r = radius_at(local);
     let past = dot(curl.axis_normal, local) - curl.axis_d;
     let theta = past / r;
     // 带宽 = 这一像素跨过的距离。硬边之所以难看不是因为它硬，是因为它走的是台阶；台阶换成
@@ -254,8 +274,20 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(paper, 1.0);
     }
 
-    // 柱面那一段的法向：绕着折线转过 θ，正对读者是 θ = 0，与视线齐平是 θ = π/2。
-    let n = vec3<f32>(curl.axis_normal * sin(theta), cos(theta));
+    // 卷面法向：圆柱那一条是 `(n·sinθ, cosθ)`；圆锥的半径沿折痕变化，法向还要沿切向
+    // 偏一点 —— 偏量是 `r'(s)·(cosθ−1)`，θ=0 处不偏（贴着折痕），往背面一路增大。
+    // 不做这一项的话，圆锥的几何在卷，受光却还是直筒，亮脊不会跟着锥面斜。
+    let cone_denom = curl.cone_a.y - curl.cone_a.x;
+    let r_prime = select(
+        0.0,
+        curl.cone_a.z * curl.radius / cone_denom,
+        abs(cone_denom) > 1.0,
+    );
+    let tangent = vec2<f32>(-curl.axis_normal.y, curl.axis_normal.x);
+    let n = normalize(
+        vec3<f32>(curl.axis_normal * sin(theta), cos(theta))
+            + vec3<f32>(tangent, 0.0) * (r_prime * (cos(theta) - 1.0)),
+    );
     let light = normalize(curl.light_dir.xyz);
     let diffuse = max(dot(n, light), 0.0);
     let light_z = max(light.z, 0.001);
