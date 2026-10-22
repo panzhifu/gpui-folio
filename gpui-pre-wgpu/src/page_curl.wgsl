@@ -75,6 +75,10 @@ const BACK_INK: f32 = 0.12;
 /// 需要第二片网格 + 一条混合管线 + 压在新页之上卷面之下的层级，那是渲染器里的一趟。
 const ROOT_SHADE: f32 = 0.18;
 
+/// 投影最深那一格压掉几成。参照那一派（`CurlMesh` 的 `mPenumbraColor`）给的是随高度线性到
+/// 满值再乘一个系数，这里取 0.35 —— 纸抬到最高（`z = 2R`）那一片底下最暗。
+const SHADOW_PEAK: f32 = 0.35;
+
 struct VertexInput {
     @location(0) position: vec2<f32>,
     @location(1) uv: vec2<f32>,
@@ -95,6 +99,8 @@ struct VertexOutput {
     /// 时数值相同 —— 页一内缩或 DPI 不为 1 就分开了。片元要把采样坐标映回页局部（现算折线、
     /// 背面透墨的镜像）必须读这一份，别拿那一份去反解。
     @location(5) material: vec2<f32>,
+    /// 投影那一趟用的浓度（`0` = 这一趟不画投影）。正面那趟不读它。
+    @location(6) shadow_alpha: f32,
 }
 
 struct Deformed {
@@ -175,6 +181,36 @@ fn vs_page_curl(input: VertexInput) -> VertexOutput {
         min(local.y, curl.page_size.y - local.y),
     );
     return out;
+}
+
+/// 投影那一趟的顶点：把卷起来的网格沿 `-n` 按**抬起高度**平移，再钉在页面平面上。
+///
+/// 偏移与浓度都 `∝ z` —— 照 `harism/android-pagecurl` 的 `CurlMesh`：
+/// `sv.mPenumbraX = (v.mPosZ / 2) * -curlDir.x`、`sv.mPenumbraColor = v.mPosZ / radius`
+/// （背面那一段换成 `(v.mPosZ − radius) / (2 * radius)`）。折痕处 `z = 0` ⇒ 那里既不移也不暗，
+/// 纸还贴着页，本来就没有影；越往柱顶抬，落点离折线越远、影越浓。
+@vertex
+fn vs_page_curl_shadow(input: VertexInput) -> VertexOutput {
+    let def = deform(input.position);
+    let r = max(curl.radius, 0.001);
+    let lift = def.position.z;
+    var out: VertexOutput;
+    out.position = to_device_position(
+        def.position.xy - curl.axis_normal * (lift * 0.5), 1.0);
+    out.uv =
+        (curl.capture_origin + input.position * curl.scale_factor) / curl.window_size;
+    out.normal = def.normal;
+    out.past = def.past;
+    out.back_fade = def.back_fade;
+    out.material = input.uv;
+    out.shadow_alpha = SHADOW_PEAK * clamp(lift / (2.0 * r), 0.0, 1.0);
+    return out;
+}
+
+/// 投影那一趟的片元：一个预乘的黑，alpha 由顶点按高度给好。
+@fragment
+fn fs_page_curl_shadow(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 0.0, in.shadow_alpha);
 }
 
 @fragment

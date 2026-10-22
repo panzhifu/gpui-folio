@@ -52,6 +52,8 @@ impl GpuCurlUniforms {
 
 pub(super) struct PageCurlPipelines {
     mesh: wgpu::RenderPipeline,
+    /// 卷起那一片纸落在下面那页上的投影：同一套顶点与索引，另一条 pipeline。
+    shadow: wgpu::RenderPipeline,
 }
 
 pub(super) fn create_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -171,7 +173,40 @@ pub(super) fn create_pipelines(
         None,
     );
 
-    PageCurlPipelines { mesh }
+    // 投影那一趟：混合开着（黑压在新页的字上），深度**只测不写** —— 它钉在页面平面上，写下去
+    // 会把后面卷面那些抬起来的像素（深度更小）挡在门外，正相反的顺序才是要的。
+    let shadow = create(
+        "page_curl_shadow",
+        "vs_page_curl_shadow",
+        "fs_page_curl_shadow",
+        &[
+            Some(&layouts.globals),
+            Some(&layouts.page_curl_uniforms),
+            Some(&layouts.texture),
+        ],
+        target_format,
+        Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
+    );
+
+    PageCurlPipelines { mesh, shadow }
 }
 
 struct CaptureTexture {
@@ -472,6 +507,16 @@ impl PageCurlResources {
         if width > 0 && height > 0 {
             pass.set_scissor_rect(x, y, width, height);
         }
+
+        // 先投影再卷面：`LoadOp::Load` 保留着已经画好的那一页字，投影压上去，卷面最后盖住
+        // 它自己那一片 —— 顺序就是两层 draw 的顺序，不需要第二张深度图。
+        pass.set_pipeline(&self.pipelines.shadow);
+        pass.set_bind_group(0, globals_bind_group, &[]);
+        pass.set_bind_group(1, &self.uniform_bind_group, &[]);
+        pass.set_bind_group(2, capture_bind_group, &[]);
+        pass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
+        pass.set_index_buffer(geometry.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..frame.index_count, 0, 0..1);
 
         pass.set_pipeline(&self.pipelines.mesh);
         pass.set_bind_group(0, globals_bind_group, &[]);
