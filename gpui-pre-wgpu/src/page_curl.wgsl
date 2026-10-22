@@ -66,9 +66,14 @@ const PI: f32 = 3.141592653589793;
 /// 少的是这一格透墨，不是亮度。0.12 起：再高就分不清是纸脏了还是字透过来。
 const BACK_INK: f32 = 0.12;
 
-/// 投影最深那一格压掉几成（0 = 没有这道影，1 = 全黑）。参照那一派与鸿蒙官方示例给的都是
-/// 「贴着折痕最深、往外淡出」的一条窄带，接触处亮度约掉到 0.85~0.86 倍 ⇒ 取 0.16。
-const SHADOW_PEAK: f32 = 0.16;
+/// 卷面根部的压暗深度：纸刚离开页面那一段最暗，往柱顶一路收回纸色原样。
+///
+/// 上一版把暗压在了折痕**外侧的平摊页**上，与 harism 恰好相反 —— 它的
+/// `mPenumbraColor = v.mPosZ / radius` 与偏移 `(v.mPosZ / 2) * -curlDir` 都以抬起高度为
+/// 唯一变量，而折痕那一格 `z = 0`，那里不该有影；给还躺着的纸蒙灰就是真机量到
+/// 207→192 那个下凹的同一种错。把抬起那片真投到新页上（按 `(z/2)·(−n)` 偏移、alpha ∝ z）
+/// 需要第二片网格 + 一条混合管线 + 压在新页之上卷面之下的层级，那是渲染器里的一趟。
+const ROOT_SHADE: f32 = 0.18;
 
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -208,9 +213,9 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
         // `past` 已经是逐像素解析距离，所以这条带不要第二片网格、不多一次采样、也不走 CPU 的
         // `Shades` 那一层（那条路上 gpui 的渐变只装两个色标，糊不出这道深浅）。
         let shadow_w = max(r * 0.5, 1.0);
-        let shadow = clamp(-past / shadow_w, 0.0, 1.0);
-        let ink = SHADOW_PEAK * (1.0 - shadow) * (1.0 - shadow);
-        return vec4<f32>(paper * (1.0 - ink), 1.0);
+        // 平摊那一片就是页面本身，一个字都不调：折痕处纸还贴在页上（`z = 0`），
+        // 那里没有影可画。抬起那一段的根部压暗在下面的 `front` 里，真投影另说。
+        return vec4<f32>(paper, 1.0);
     }
 
     // 柱面那一段的法向：绕着折线转过 θ，正对读者是 θ = 0，与视线齐平是 θ = π/2。
@@ -225,7 +230,13 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
     // 反而掉到 0.69，真机上量到的是卷曲带比纸面还暗（207→192 那个下凹）：受光装反了。
     // N·L 现在只留一点点调制。
     let crest = sin(roll * PI);
-    let front = paper * (1.0 + 0.10 * crest + 0.05 * (diffuse / light_z - 1.0) * (1.0 - crest));
+    // 根部压暗：`height = 1 − cos θ` 归一的就是「纸离页多高」（`z = R·height`）。折痕处
+    // `height = 0` ⇒ 一点不压，抬到柱面中段最深，再往柱顶收 —— 与 harism 那句
+    // `mColorFactor = .1 + .9·sqrt(...)` 同一个形状：暗部跟着**抬起高度**走，不是贴在折痕上。
+    let height = 1.0 - cos(theta);
+    let root = ROOT_SHADE * height * clamp(1.0 - roll * 1.5, 0.0, 1.0);
+    let front = paper * (1.0 + 0.10 * crest + 0.05 * (diffuse / light_z - 1.0) * (1.0 - crest)
+        - root);
 
     // 背面 = 接近纸白 + **对面那一版字透过来**，再只在贴着柱顶那一窄条压一道内侧影。参照里
     // 那句「整片 ×0.92、内侧再 ×0.82」在真机上量到 192 / 235 两档，摊开成一条三百多像素的
