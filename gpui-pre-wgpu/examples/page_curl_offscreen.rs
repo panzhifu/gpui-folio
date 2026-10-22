@@ -20,7 +20,9 @@ const GRID: usize = 96;
 fn main() -> anyhow::Result<()> {
     // 512 而不是 256：网格一格 = 边长/96，边长太小台阶只有两三个像素，量不出差别。
     let side = 512;
-    let out = std::env::args().nth(1).unwrap_or_else(|| "/tmp/page_curl_offscreen.png".into());
+    let out = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/tmp/page_curl_offscreen.png".into());
     let size = Size {
         width: DevicePixels(side),
         height: DevicePixels(side),
@@ -78,10 +80,7 @@ fn main() -> anyhow::Result<()> {
             let mut v = Vec::with_capacity((GRID + 1) * (GRID + 1));
             for y in 0..=GRID {
                 for x in 0..=GRID {
-                    let (u, w) = (
-                        x as f32 / GRID as f32,
-                        y as f32 / GRID as f32,
-                    );
+                    let (u, w) = (x as f32 / GRID as f32, y as f32 / GRID as f32);
                     v.push(PageCurlVertex {
                         position: [u * side as f32, w * side as f32],
                         uv: [u, w],
@@ -96,7 +95,14 @@ fn main() -> anyhow::Result<()> {
             for y in 0..GRID as u32 {
                 for x in 0..GRID as u32 {
                     let a = y * columns + x;
-                    idx.extend_from_slice(&[a, a + columns, a + 1, a + 1, a + columns, a + columns + 1]);
+                    idx.extend_from_slice(&[
+                        a,
+                        a + columns,
+                        a + 1,
+                        a + 1,
+                        a + columns,
+                        a + columns + 1,
+                    ]);
                 }
             }
             idx
@@ -121,10 +127,6 @@ fn main() -> anyhow::Result<()> {
     let mut renderer = WgpuHeadlessRenderer::new()?;
     let image = renderer.render_to_image(&scene, size)?;
     image.save(&out)?;
-    println!(
-        "wrote {out} ({}x{})",
-        image.width(),
-        image.height()
-    );
+    println!("wrote {out} ({}x{})", image.width(), image.height());
     Ok(())
 }
