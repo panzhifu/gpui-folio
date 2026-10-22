@@ -66,6 +66,10 @@ const PI: f32 = 3.141592653589793;
 /// 少的是这一格透墨，不是亮度。0.12 起：再高就分不清是纸脏了还是字透过来。
 const BACK_INK: f32 = 0.12;
 
+/// 投影最深那一格压掉几成（0 = 没有这道影，1 = 全黑）。参照那一派与鸿蒙官方示例给的都是
+/// 「贴着折痕最深、往外淡出」的一条窄带，接触处亮度约掉到 0.85~0.86 倍 ⇒ 取 0.16。
+const SHADOW_PEAK: f32 = 0.16;
+
 struct VertexInput {
     @location(0) position: vec2<f32>,
     @location(1) uv: vec2<f32>,
@@ -81,6 +85,11 @@ struct VertexOutput {
     @location(3) edge: f32,
     /// 背面离折痕的归一化距离（0 = 贴着折痕，1 = 自由边），给背面压内侧渐变。
     @location(4) back_fade: f32,
+    /// **材质坐标** `0..1`，原点在页的左上角。`@location(0)` 那一份是「采样用的窗口归一坐标」
+    /// `(capture_origin + 局部) / window`，两者只在「页铺满窗口、`capture_origin = 0`、缩放 1」
+    /// 时数值相同 —— 页一内缩或 DPI 不为 1 就分开了。片元要把采样坐标映回页局部（现算折线、
+    /// 背面透墨的镜像）必须读这一份，别拿那一份去反解。
+    @location(5) material: vec2<f32>,
 }
 
 struct Deformed {
@@ -152,6 +161,9 @@ fn vs_page_curl(input: VertexInput) -> VertexOutput {
     out.normal = def.normal;
     out.past = def.past;
     out.back_fade = def.back_fade;
+    // 材质坐标原样带下去：片元要用它把「这一像素是页上的哪一点」问回来，而上面那份 `out.uv`
+    // 是采样坐标（窗口归一 + 烘时原点），拿它反解页局部在页内缩或缩放不为 1 时就是错的。
+    out.material = input.uv;
     let local = input.position * curl.scale_factor;
     out.edge = min(
         min(local.x, curl.page_size.x - local.x),
@@ -176,9 +188,9 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
     // 顶点插值出来的 `past` 与 `normal`，等值线只能对齐网格顶点 —— 网格一格 = 页宽/96 ≈
     // 手机上 11 个物理像素，于是斜着的接缝在屏上是一格一格的台阶（真机量到过，读者报的
     // 「右下角跳动」里空间那一半就是它）。而 `uv` 是材质坐标，它在三角形内线性插值出来的
-    // 就是那一点本身：`n·(uv·页尺寸·缩放) − d0` 逐像素精确，等值线是一条**解析直线**。
+    // 就是那一点本身：`n·(材质·页尺寸) − d0` 逐像素精确，等值线是一条**解析直线**。
     // 顺带法向也不用插值了 —— 卷成柱面那一段的法向由 `θ = past / R` 完全决定。
-    let local = in.uv * curl.page_size * curl.scale_factor;
+    let local = in.material * curl.page_size;
     let r = max(curl.radius, 0.001);
     let past = dot(curl.axis_normal, local) - curl.axis_d;
     let theta = past / r;
@@ -187,9 +199,18 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
     let w = max(fwidth(past), 1e-4);
 
     if (past <= -w) {
-        // 平摊那一片就是页面本身，一个字都不调：绝大多数像素走这一条，一次采样就够。
-        // 参照实现也不在平摊纸上画投影；投影是卷筒自己的事，乘到这里就成了整条纸边罩灰。
-        return vec4<f32>(paper, 1.0);
+        // 平摊那一片 = 页面本身 + 卷起来那一片纸落在它上面的一道投影。
+        //
+        // 这**不是**「把投影乘进整张平摊页面」：那一条会在整条纸边罩出一层浅灰（真机量到
+        // 207→192 那个下凹就是它，也是这一档从前被否掉的原因）。这里是一道**贴着折痕**的窄带：
+        // 宽度跟着卷径走（`0.5·R`，页宽 390 那一档约 27 逻辑像素，与鸿蒙官方示例的
+        // `maxShadowWidth = 30` 同一量级），折痕处最深、到带尾归零，带尾之外一个字都不调。
+        // `past` 已经是逐像素解析距离，所以这条带不要第二片网格、不多一次采样、也不走 CPU 的
+        // `Shades` 那一层（那条路上 gpui 的渐变只装两个色标，糊不出这道深浅）。
+        let shadow_w = max(r * 0.5, 1.0);
+        let shadow = clamp(-past / shadow_w, 0.0, 1.0);
+        let ink = SHADOW_PEAK * (1.0 - shadow) * (1.0 - shadow);
+        return vec4<f32>(paper * (1.0 - ink), 1.0);
     }
 
     // 柱面那一段的法向：绕着折线转过 θ，正对读者是 θ = 0，与视线齐平是 θ = π/2。
@@ -214,7 +235,7 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
     // 透墨那一次采的是**同一张**捕获纹理，只是把材质坐标沿页的中线左右镜像（背面看到的字
     // 本来就是反的）：不新增 uniform、不新增 pass，只在背面那几片多一次采样。镜像后的坐标
     // 恒落在 `[0, 页宽]` 里 ⇒ 采不到捕获矩形的外圈 —— 那一圈没被写过，采到就是黑。
-    let material = in.uv * curl.page_size;
+    let material = in.material * curl.page_size;
     let ghost_uv =
         (curl.capture_origin + vec2<f32>(curl.page_size.x - material.x, material.y)) / curl.window_size;
     let ghost = textureSampleLevel(
