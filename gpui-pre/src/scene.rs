@@ -36,6 +36,18 @@ impl From<bool> for PaddedBool32 {
     }
 }
 
+/// 捕获层的 `DrawOrder` 起点。捕获层里的 primitive 一律排到普通场景之后，
+/// 主 pass 只画 `< CAPTURE_ORDER_BASE`，捕获 pass 按层取一段。
+pub const CAPTURE_ORDER_BASE: DrawOrder = 1_000_000_000;
+/// 每一层捕获占这么多个 order，层号越大越靠后。
+pub const CAPTURE_ORDER_STRIDE: DrawOrder = 1_000_000;
+
+/// 第 `layer` 层（从 1 起）的 order 区间。
+pub fn capture_order_range(layer: u8) -> Range<DrawOrder> {
+    let base = CAPTURE_ORDER_BASE + u32::from(layer) * CAPTURE_ORDER_STRIDE;
+    base..base + CAPTURE_ORDER_STRIDE
+}
+
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
@@ -61,6 +73,13 @@ pub struct Scene {
     /// 捕获纹理首帧清屏用的颜色。捕获矩形之外必须与纸张同色：卷曲网格按窗口归一
     /// 取 uv，落在矩形外的那一两个像素若清成透明黑，就会读成页边的一条黑带。
     pub page_capture_clear_color: Option<Rgba>,
+    /// 背面那一页的捕获请求（第 2 层）。`None` = 这一帧不烘背面。
+    pub page_capture_back: Option<Bounds<ScaledPixels>>,
+    pub page_capture_back_clear_color: Option<Rgba>,
+    /// 当前绘制进哪一层捕获（0 = 主场景）。由 [`crate::Window::set_capture_layer`] 在
+    /// 绘制回调里切；`insert_primitive` 据此把 order 推到对应的高段。
+    pub capture_layer: u8,
+    capture_counter: DrawOrder,
 }
 
 #[expect(missing_docs)]
@@ -80,6 +99,10 @@ impl Scene {
         self.page_curl_meshes.clear();
         self.page_capture = None;
         self.page_capture_clear_color = None;
+        self.page_capture_back = None;
+        self.page_capture_back_clear_color = None;
+        self.capture_layer = 0;
+        self.capture_counter = 0;
     }
 
     pub fn len(&self) -> usize {
@@ -108,11 +131,17 @@ impl Scene {
             return;
         }
 
-        let order = self
-            .layer_stack
-            .last()
-            .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        let order = if self.capture_layer > 0 {
+            self.capture_counter += 1;
+            CAPTURE_ORDER_BASE
+                + u32::from(self.capture_layer) * CAPTURE_ORDER_STRIDE
+                + self.capture_counter
+        } else {
+            self.layer_stack
+                .last()
+                .copied()
+                .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds))
+        };
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -189,7 +218,14 @@ impl Scene {
         allow(dead_code)
     )]
     pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
+        self.batches_in(0..u32::MAX)
+    }
+
+    /// 只取 `order` 落在 `range` 里的 primitive。主 pass 用 `0..CAPTURE_ORDER_BASE`，
+    /// 捕获 pass 用 [`capture_order_range`]。
+    pub fn batches_in(&self, range: Range<DrawOrder>) -> impl Iterator<Item = PrimitiveBatch> + '_ {
         BatchIterator {
+            range,
             shadows_start: 0,
             shadows_iter: self.shadows.iter().peekable(),
             quads_start: 0,
@@ -292,6 +328,7 @@ impl Primitive {
     allow(dead_code)
 )]
 struct BatchIterator<'a> {
+    range: Range<DrawOrder>,
     shadows_start: usize,
     shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
     quads_start: usize,
@@ -316,6 +353,70 @@ impl<'a> Iterator for BatchIterator<'a> {
     type Item = PrimitiveBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // 把不在本层区间里的 primitive 全部跳过去；主 pass 与捕获 pass 各拿一段 order。
+        while self
+            .shadows_iter
+            .peek()
+            .is_some_and(|item| !self.range.contains(&item.order))
+        {
+            self.shadows_iter.next();
+        }
+        while self
+            .quads_iter
+            .peek()
+            .is_some_and(|item| !self.range.contains(&item.order))
+        {
+            self.quads_iter.next();
+        }
+        while self
+            .paths_iter
+            .peek()
+            .is_some_and(|item| !self.range.contains(&item.order))
+        {
+            self.paths_iter.next();
+        }
+        while self
+            .underlines_iter
+            .peek()
+            .is_some_and(|item| !self.range.contains(&item.order))
+        {
+            self.underlines_iter.next();
+        }
+        while self
+            .monochrome_sprites_iter
+            .peek()
+            .is_some_and(|item| !self.range.contains(&item.order))
+        {
+            self.monochrome_sprites_iter.next();
+        }
+        while self
+            .subpixel_sprites_iter
+            .peek()
+            .is_some_and(|item| !self.range.contains(&item.order))
+        {
+            self.subpixel_sprites_iter.next();
+        }
+        while self
+            .polychrome_sprites_iter
+            .peek()
+            .is_some_and(|item| !self.range.contains(&item.order))
+        {
+            self.polychrome_sprites_iter.next();
+        }
+        while self
+            .surfaces_iter
+            .peek()
+            .is_some_and(|item| !self.range.contains(&item.order))
+        {
+            self.surfaces_iter.next();
+        }
+        while self
+            .page_curl_meshes_iter
+            .peek()
+            .is_some_and(|item| !self.range.contains(&item.order))
+        {
+            self.page_curl_meshes_iter.next();
+        }
         let mut orders_and_kinds = [
             (
                 self.shadows_iter.peek().map(|s| s.order),

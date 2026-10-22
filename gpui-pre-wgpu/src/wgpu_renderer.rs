@@ -1564,6 +1564,44 @@ impl WgpuRendererCore {
                 capture_clear,
                 scissor_for(bounds, size),
                 true,
+                gpui::capture_order_range(1),
+                &instance_bindings,
+                &mut instance_offset,
+            )?;
+        }
+
+        // 背面那一页：同一棵场景里第 2 层的 primitive，写另一张捕获纹理。
+        if let Some(bounds) = scene.page_capture_back {
+            let back_view = {
+                let resources = &mut self.resources;
+                let device = &resources.device;
+                let layouts = &resources.bind_group_layouts;
+                resources
+                    .page_curl
+                    .back_capture_view(device, layouts, size)
+                    .clone()
+            };
+            let capture_clear = scene
+                .page_capture_back_clear_color
+                .map(|color| wgpu::Color {
+                    r: f64::from(color.r),
+                    g: f64::from(color.g),
+                    b: f64::from(color.b),
+                    a: f64::from(color.a),
+                })
+                .unwrap_or(wgpu::Color::WHITE);
+            self.encode_scene(
+                scene,
+                &mut encoder,
+                &back_view,
+                size,
+                capture_clear,
+                scissor_for(bounds, size),
+                true,
+                // 真实背页的捕获层 2 还没接；先用主层把当前页烘进背面纹理，
+                // shader 仍按镜像采样，读起来与旧的透墨接近。接上 capture layer 后
+                // 改成 `gpui::capture_order_range(2)`。
+                0..gpui::CAPTURE_ORDER_BASE,
                 &instance_bindings,
                 &mut instance_offset,
             )?;
@@ -1577,6 +1615,7 @@ impl WgpuRendererCore {
             clear_color,
             None,
             false,
+            0..gpui::CAPTURE_ORDER_BASE,
             &instance_bindings,
             &mut instance_offset,
         )?;
@@ -1598,6 +1637,7 @@ impl WgpuRendererCore {
         clear_color: wgpu::Color,
         scissor: Option<ScissorRect>,
         skip_meshes: bool,
+        layer_range: std::ops::Range<gpui::DrawOrder>,
         instance_bindings: &InstanceBindings,
         instance_offset: &mut u64,
     ) -> Result<()> {
@@ -1608,7 +1648,7 @@ impl WgpuRendererCore {
             scissor,
         );
 
-        for batch in scene.batches() {
+        for batch in scene.batches_in(layer_range) {
             match batch {
                 PrimitiveBatch::Quads(range) => self.draw_instances(
                     &instance_bindings.quads,

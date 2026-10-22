@@ -70,6 +70,8 @@ pub struct PageCurlUniforms {
     /// 378 设备像素的纯黑带（烘的那一刻栏还偏着 134.4 逻辑像素）。几何照**本帧**的 `page_origin`
     /// 摆，采样照**烘时**的这里给，两类错位一起消失。
     pub capture_origin: [f32; 2],
+    /// 背面捕获纹理（下一跨页的另一半）里，那张纸左上角在窗口里的位置。
+    pub back_capture_origin: [f32; 2],
 }
 
 /// 调用方交给 [`Window::paint_page_curl_mesh`](crate::Window::paint_page_curl_mesh)

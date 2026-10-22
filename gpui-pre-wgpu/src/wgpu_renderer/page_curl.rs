@@ -37,6 +37,8 @@ struct GpuCurlUniforms {
     shadow_map_size: f32,
     _pad1: [f32; 3],
     light_view_proj: [[f32; 4]; 4],
+    back_capture_origin: [f32; 2],
+    _pad2: [f32; 2],
 }
 
 impl GpuCurlUniforms {
@@ -59,6 +61,8 @@ impl GpuCurlUniforms {
             shadow_map_size: SHADOW_MAP_SIZE as f32,
             _pad1: [0.0; 3],
             light_view_proj,
+            back_capture_origin: uniforms.back_capture_origin,
+            _pad2: [0.0; 2],
         }
     }
 }
@@ -180,7 +184,8 @@ pub(super) fn create_pipelines(
             Some(&layouts.globals),
             Some(&layouts.page_curl_uniforms),
             Some(&layouts.texture),
-            // group 3：光源方向的 shadow map。
+            // group 3：光源方向的 shadow map；group 4：下一跨页背面的捕获纹理。
+            Some(&layouts.texture),
             Some(&layouts.texture),
         ],
         target_format,
@@ -248,6 +253,7 @@ pub(super) struct PageCurlResources {
     uniform_bind_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
     capture: Option<CaptureTexture>,
+    back_capture: Option<CaptureTexture>,
     depth: Option<DepthTexture>,
     shadow: Option<ShadowTexture>,
     geometry: Option<GeometryCache>,
@@ -294,6 +300,7 @@ impl PageCurlResources {
             uniform_bind_group,
             sampler,
             capture: None,
+            back_capture: None,
             depth: None,
             shadow: None,
             geometry: None,
@@ -304,6 +311,7 @@ impl PageCurlResources {
 
     pub(super) fn invalidate_size_dependent(&mut self) {
         self.capture = None;
+        self.back_capture = None;
         self.depth = None;
         self.geometry = None;
         self.frame = None;
@@ -499,6 +507,60 @@ impl PageCurlResources {
         &self.capture.as_ref().unwrap().view
     }
 
+    /// 背面那一页的捕获纹理，尺寸/格式与正面一致。
+    pub(super) fn back_capture_view(
+        &mut self,
+        device: &wgpu::Device,
+        layouts: &WgpuBindGroupLayouts,
+        size: Size<DevicePixels>,
+    ) -> &wgpu::TextureView {
+        let needs_new = self
+            .back_capture
+            .as_ref()
+            .map(|capture| capture.size != size)
+            .unwrap_or(true);
+        if needs_new {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("page_capture_back"),
+                size: wgpu::Extent3d {
+                    width: size.width.0.max(1) as u32,
+                    height: size.height.0.max(1) as u32,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.target_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("page_capture_back_bind_group"),
+                layout: &layouts.texture,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            self.back_capture = Some(CaptureTexture {
+                _texture: texture,
+                view,
+                bind_group,
+                size,
+            });
+        }
+        &self.back_capture.as_ref().unwrap().view
+    }
+
     fn ensure_depth(&mut self, device: &wgpu::Device, size: Size<DevicePixels>) {
         if self.depth.as_ref().is_some_and(|depth| depth.size == size) {
             return;
@@ -551,6 +613,11 @@ impl PageCurlResources {
             return;
         };
         let capture_bind_group = &capture.bind_group;
+        let Some(back_capture) = self.back_capture.as_ref() else {
+            log::debug!("page_curl: 缺背面捕获纹理，这一帧不画卷曲网格");
+            return;
+        };
+        let back_capture_bind_group = &back_capture.bind_group;
 
         let b = frame.page_bounds;
         let x = b.origin.x.0.max(0.0) as u32;
@@ -602,6 +669,7 @@ impl PageCurlResources {
         pass.set_bind_group(1, &self.uniform_bind_group, &[]);
         pass.set_bind_group(2, capture_bind_group, &[]);
         pass.set_bind_group(3, &shadow.bind_group, &[]);
+        pass.set_bind_group(4, back_capture_bind_group, &[]);
         pass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
         pass.set_index_buffer(geometry.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..frame.index_count, 0, 0..1);

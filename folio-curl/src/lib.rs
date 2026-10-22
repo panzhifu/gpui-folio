@@ -57,6 +57,8 @@ pub struct CurlUniforms {
     pub cone_a: [f32; 4],
     /// `[最大半径, 0, 0, 0]`。单独一格是为了保持 16 字节对齐。
     pub cone_b: [f32; 4],
+    /// 背面捕获纹理里那张纸左上角在窗口里的位置。
+    pub back_capture_origin: [f32; 2],
 }
 
 /// 生成 `GRID_X × GRID_Y` 的页面网格（三角形列表）。

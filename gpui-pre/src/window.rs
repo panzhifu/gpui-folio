@@ -4794,6 +4794,10 @@ impl Window {
             uniforms.capture_origin[0] * scale_factor,
             uniforms.capture_origin[1] * scale_factor,
         ];
+        uniforms.back_capture_origin = [
+            uniforms.back_capture_origin[0] * scale_factor,
+            uniforms.back_capture_origin[1] * scale_factor,
+        ];
         uniforms.window_size = [
             f32::from(viewport.width) * scale_factor,
             f32::from(viewport.height) * scale_factor,
@@ -4843,6 +4847,24 @@ impl Window {
         let scene = &mut self.next_frame.scene;
         scene.page_capture = Some(capture);
         scene.page_capture_clear_color = Some(clear_color);
+    }
+
+    /// 背面那一页的捕获请求（第 2 层）。与正面同一套口径，渲染器写另一张纹理。
+    pub fn capture_page_region_back_with_color(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        clear_color: crate::Rgba,
+    ) {
+        let capture = bounds.scale(self.scale_factor());
+        let scene = &mut self.next_frame.scene;
+        scene.page_capture_back = Some(capture);
+        scene.page_capture_back_clear_color = Some(clear_color);
+    }
+
+    /// 绘制回调里切捕获层：之后的 primitive 排到 `layer` 的高 order 段，主 pass 跳过。
+    /// `0` = 回到主场景。调用方必须在同一次绘制里切回 `0`，否则后续内容全被藏起来。
+    pub fn set_capture_layer(&mut self, layer: u8) {
+        self.next_frame.scene.capture_layer = layer;
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.

@@ -59,6 +59,9 @@ struct CurlUniforms {
     _pad1: vec3<f32>,
     /// 光源方向上的正交投影：世界坐标 → 光源裁剪空间。
     light_view_proj: mat4x4<f32>,
+    /// 背面捕获纹理里，那张纸左上角在窗口里的位置（设备像素）。
+    back_capture_origin: vec2<f32>,
+    _pad2: vec2<f32>,
 }
 
 @group(1) @binding(0) var<uniform> curl: CurlUniforms;
@@ -69,15 +72,11 @@ struct CurlUniforms {
 @group(3) @binding(0) var shadow_texture: texture_2d<f32>;
 @group(3) @binding(1) var shadow_sampler: sampler;
 
+@group(4) @binding(0) var back_texture: texture_2d<f32>;
+@group(4) @binding(1) var back_sampler: sampler;
+
 const PI: f32 = 3.141592653589793;
 const SHADOW_BIAS: f32 = 0.0015;
-
-/// 背面透墨的量：从这一页**正面**的字按几成透过来（0 = 死白的一张纸，1 = 正面原样）。
-///
-/// 书上的纸不是不透的：卷起来那一片的背面，看得见对面那一版字的淡影（左右反）。参照那一派
-/// （`harism/android-pagecurl` 的 `CurlPatch`）给的是纯色纸 ×0.92，真机上读成一张死白 ——
-/// 少的是这一格透墨，不是亮度。0.12 起：再高就分不清是纸脏了还是字透过来。
-const BACK_INK: f32 = 0.12;
 
 /// 卷面根部的压暗深度：纸刚离开页面那一段最暗，往柱顶一路收回纸色原样。
 ///
@@ -316,21 +315,23 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
     // 灰带 —— 读者报的「黑条」就是它。这里底提到 0.94，让那道影在六分之一段内就走完，读出来
     // 是一条接触线而不是一条带。
     //
-    // 透墨那一次采的是**同一张**捕获纹理，只是把材质坐标沿页的中线左右镜像（背面看到的字
-    // 本来就是反的）：不新增 uniform、不新增 pass，只在背面那几片多一次采样。镜像后的坐标
-    // 恒落在 `[0, 页宽]` 里 ⇒ 采不到捕获矩形的外圈 —— 那一圈没被写过，采到就是黑。
+    // 背面采的是**下一跨页的另一半**（捕获层 2），不是正面镜像透墨。纸翻过去后背面看到的
+    // 字与正面左右相反，所以材质 U 取镜像；镜像后的坐标仍落在捕获矩形里。
     let material = in.material * curl.page_size;
-    let ghost_uv =
-        (curl.capture_origin + vec2<f32>(curl.page_size.x - material.x, material.y)) / curl.window_size;
-    let ghost = textureSampleLevel(
-        capture_texture,
-        capture_sampler,
-        clamp(ghost_uv, uv_min, uv_max),
+    let back_uv = (curl.back_capture_origin
+        + vec2<f32>(curl.page_size.x - material.x, material.y))
+        / curl.window_size;
+    let back_min = (curl.back_capture_origin + vec2<f32>(0.5)) / curl.window_size;
+    let back_max =
+        (curl.back_capture_origin + curl.page_size - vec2<f32>(0.5)) / curl.window_size;
+    let back_paper = textureSampleLevel(
+        back_texture,
+        back_sampler,
+        clamp(back_uv, back_min, back_max),
         0.0,
     ).rgb;
     let back_fade = clamp((theta - PI) / 1.5, 0.0, 1.0);
-    let back = mix(curl.back_color.rgb, ghost, BACK_INK)
-        * mix(0.94, 1.0, min(back_fade * 6.0, 1.0));
+    let back = back_paper * mix(0.94, 1.0, min(back_fade * 6.0, 1.0));
 
     // 正面 ↔ 背面：纸绕过柱顶转过去的那一瞬（θ = π/2，即 `past = πR/2`）法向过零。从前这里
     // 是 `n.z >= 0` 一刀切 —— 判据本身没错，错在它读的是插值法向，于是那条线落在网格上就是
