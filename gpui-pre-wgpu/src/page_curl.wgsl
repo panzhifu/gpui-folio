@@ -54,6 +54,11 @@ struct CurlUniforms {
     capture_origin: vec2<f32>,
     /// 保持 uniform 结构体 16 字节对齐；没有语义。
     _padding: vec2<f32>,
+    /// shadow map 的边长（像素），PCF 的纹素步长。
+    shadow_map_size: f32,
+    _pad1: vec3<f32>,
+    /// 光源方向上的正交投影：世界坐标 → 光源裁剪空间。
+    light_view_proj: mat4x4<f32>,
 }
 
 @group(1) @binding(0) var<uniform> curl: CurlUniforms;
@@ -61,7 +66,11 @@ struct CurlUniforms {
 @group(2) @binding(0) var capture_texture: texture_2d<f32>;
 @group(2) @binding(1) var capture_sampler: sampler;
 
+@group(3) @binding(0) var shadow_texture: texture_2d<f32>;
+@group(3) @binding(1) var shadow_sampler: sampler;
+
 const PI: f32 = 3.141592653589793;
+const SHADOW_BIAS: f32 = 0.0015;
 
 /// 背面透墨的量：从这一页**正面**的字按几成透过来（0 = 死白的一张纸，1 = 正面原样）。
 ///
@@ -72,16 +81,8 @@ const BACK_INK: f32 = 0.12;
 
 /// 卷面根部的压暗深度：纸刚离开页面那一段最暗，往柱顶一路收回纸色原样。
 ///
-/// 上一版把暗压在了折痕**外侧的平摊页**上，与 harism 恰好相反 —— 它的
-/// `mPenumbraColor = v.mPosZ / radius` 与偏移 `(v.mPosZ / 2) * -curlDir` 都以抬起高度为
-/// 唯一变量，而折痕那一格 `z = 0`，那里不该有影；给还躺着的纸蒙灰就是真机量到
-/// 207→192 那个下凹的同一种错。把抬起那片真投到新页上（按 `(z/2)·(−n)` 偏移、alpha ∝ z）
-/// 需要第二片网格 + 一条混合管线 + 压在新页之上卷面之下的层级，那是渲染器里的一趟。
+/// 这是**卷面自己的**接触暗部；平摊页上的投影由下面的 shadow map 给，不在这里乘进去。
 const ROOT_SHADE: f32 = 0.18;
-
-/// 投影最深那一格压掉几成。参照那一派（`CurlMesh` 的 `mPenumbraColor`）给的是随高度线性到
-/// 满值再乘一个系数，这里取 0.35 —— 纸抬到最高（`z = 2R`）那一片底下最暗。
-const SHADOW_PEAK: f32 = 0.35;
 
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -103,8 +104,8 @@ struct VertexOutput {
     /// 时数值相同 —— 页一内缩或 DPI 不为 1 就分开了。片元要把采样坐标映回页局部（现算折线、
     /// 背面透墨的镜像）必须读这一份，别拿那一份去反解。
     @location(5) material: vec2<f32>,
-    /// 投影那一趟用的浓度（`0` = 这一趟不画投影）。正面那趟不读它。
-    @location(6) shadow_alpha: f32,
+    /// 世界坐标在该点上的光源裁剪空间坐标，给 shadow map 的 PCF 用。
+    @location(6) light_pos: vec4<f32>,
 }
 
 struct Deformed {
@@ -199,37 +200,48 @@ fn vs_page_curl(input: VertexInput) -> VertexOutput {
         min(local.x, curl.page_size.x - local.x),
         min(local.y, curl.page_size.y - local.y),
     );
+    out.light_pos = curl.light_view_proj * vec4<f32>(def.position, 1.0);
     return out;
 }
 
-/// 投影那一趟的顶点：把卷起来的网格沿 `-n` 按**抬起高度**平移，再钉在页面平面上。
-///
-/// 偏移与浓度都 `∝ z` —— 照 `harism/android-pagecurl` 的 `CurlMesh`：
-/// `sv.mPenumbraX = (v.mPosZ / 2) * -curlDir.x`、`sv.mPenumbraColor = v.mPosZ / radius`
-/// （背面那一段换成 `(v.mPosZ − radius) / (2 * radius)`）。折痕处 `z = 0` ⇒ 那里既不移也不暗，
-/// 纸还贴着页，本来就没有影；越往柱顶抬，落点离折线越远、影越浓。
+struct ShadowOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) depth: f32,
+}
+
+/// 深度趟：把同一张网格从光源方向渲进 shadow map。
 @vertex
-fn vs_page_curl_shadow(input: VertexInput) -> VertexOutput {
+fn vs_shadow(input: VertexInput) -> ShadowOutput {
     let def = deform(input.position);
-    let r = radius_at(input.position * curl.scale_factor);
-    let lift = def.position.z;
-    var out: VertexOutput;
-    out.position = to_device_position(
-        def.position.xy - curl.axis_normal * (lift * 0.5), 1.0);
-    out.uv =
-        (curl.capture_origin + input.position * curl.scale_factor) / curl.window_size;
-    out.normal = def.normal;
-    out.past = def.past;
-    out.back_fade = def.back_fade;
-    out.material = input.uv;
-    out.shadow_alpha = SHADOW_PEAK * clamp(lift / (2.0 * r), 0.0, 1.0);
+    var out: ShadowOutput;
+    out.position = curl.light_view_proj * vec4<f32>(def.position, 1.0);
+    out.depth = out.position.z / out.position.w;
     return out;
 }
 
-/// 投影那一趟的片元：一个预乘的黑，alpha 由顶点按高度给好。
 @fragment
-fn fs_page_curl_shadow(in: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(0.0, 0.0, 0.0, in.shadow_alpha);
+fn fs_shadow(in: ShadowOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.depth, 0.0, 0.0, 1.0);
+}
+
+/// 3×3 PCF：`0` = 完全在影里，`1` = 完全受光。
+fn sample_shadow(light_pos: vec4<f32>) -> f32 {
+    let ndc = light_pos.xyz / light_pos.w;
+    let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        return 1.0;
+    }
+    let texel = 1.0 / max(curl.shadow_map_size, 1.0);
+    var lit: f32 = 0.0;
+    for (var y: i32 = -1; y <= 1; y = y + 1) {
+        for (var x: i32 = 1; x >= -1; x = x - 1) {
+            let offset = vec2<f32>(f32(x), f32(y)) * texel;
+            let stored = textureSample(shadow_texture, shadow_sampler, uv + offset).r;
+            let shadowed = select(1.0, 0.0, ndc.z > stored + SHADOW_BIAS);
+            lit = lit + shadowed;
+        }
+    }
+    return lit / 9.0;
 }
 
 @fragment
@@ -259,19 +271,12 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
     // 直线之后，一到两个像素的过渡就够把剩下的锯齿吃掉。
     let w = max(fwidth(past), 1e-4);
 
+    let shadow = sample_shadow(in.light_pos);
     if (past <= -w) {
-        // 平摊那一片 = 页面本身 + 卷起来那一片纸落在它上面的一道投影。
-        //
-        // 这**不是**「把投影乘进整张平摊页面」：那一条会在整条纸边罩出一层浅灰（真机量到
-        // 207→192 那个下凹就是它，也是这一档从前被否掉的原因）。这里是一道**贴着折痕**的窄带：
-        // 宽度跟着卷径走（`0.5·R`，页宽 390 那一档约 27 逻辑像素，与鸿蒙官方示例的
-        // `maxShadowWidth = 30` 同一量级），折痕处最深、到带尾归零，带尾之外一个字都不调。
-        // `past` 已经是逐像素解析距离，所以这条带不要第二片网格、不多一次采样、也不走 CPU 的
-        // `Shades` 那一层（那条路上 gpui 的渐变只装两个色标，糊不出这道深浅）。
-        let shadow_w = max(r * 0.5, 1.0);
-        // 平摊那一片就是页面本身，一个字都不调：折痕处纸还贴在页上（`z = 0`），
-        // 那里没有影可画。抬起那一段的根部压暗在下面的 `front` 里，真投影另说。
-        return vec4<f32>(paper, 1.0);
+        // 平摊那一片：页面本身乘上 shadow map 的投影。折痕处纸还贴着页（`z = 0`），
+        // 影是卷起来那一片投下来的，不是给整条纸边罩灰 —— 旧的 `0.5R` 窄带已经删掉，
+        // 现在由深度图决定落点与软硬。
+        return vec4<f32>(paper * mix(0.62, 1.0, shadow), 1.0);
     }
 
     // 卷面法向：圆柱那一条是 `(n·sinθ, cosθ)`；圆锥的半径沿折痕变化，法向还要沿切向
@@ -335,5 +340,9 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
     let curled = mix(back, front, side);
     // 平摊 ↔ 卷起：位置在这里连续（`u` 两侧都等于 `past`），换的只有受光与内容那一档。
     let rim = vec3<f32>(0.06 * (1.0 - smoothstep(0.0, 2.0, in.edge)));
-    return vec4<f32>(mix(paper, curled + rim, smoothstep(-w, w, past)), 1.0);
+    // 卷面自己也在 shadow map 里：抬得越高、越靠近另一页，越暗。平摊那一侧用同一个
+    // shadow 采样（`0.62` 的底部比卷面深一点，影落在纸上比落在纸上再落影更重）。
+    let lit = (curled + rim) * mix(0.78, 1.0, shadow);
+    let flat = paper * mix(0.62, 1.0, shadow);
+    return vec4<f32>(mix(flat, lit, smoothstep(-w, w, past)), 1.0);
 }

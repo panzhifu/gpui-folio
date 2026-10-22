@@ -1525,7 +1525,11 @@ impl WgpuRendererCore {
             let resources = &mut self.resources;
             let device = &resources.device;
             let queue = &resources.queue;
-            resources.page_curl.prepare(scene, device, queue, size)?;
+            let layouts = &resources.bind_group_layouts;
+            let page_curl = &mut resources.page_curl;
+            page_curl.prepare(scene, device, queue, layouts, size)?;
+            let globals = &resources.globals_bind_group;
+            page_curl.encode_shadow(&mut encoder, globals);
         }
 
         // 页面捕获：把同一棵场景按页面 bounds 重画到离屏纹理。捕获 pass 不画
