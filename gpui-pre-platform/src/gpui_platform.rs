@@ -1,15 +1,29 @@
 //! Convenience crate that re-exports GPUI's platform traits and the
 //! `current_platform` constructor so consumers don't need `#[cfg]` gating.
 //!
-//! Vendored copy. Against upstream 0.3.9 only the desktop-Linux predicate moved:
-//! `target_os = "linux"` becomes `all(target_os = "linux", not(target_env = "ohos"))`,
-//! so the HarmonyOS triples (which report `target_os = "linux"`) stop pulling
-//! `gpui-pre-linux` and its X11 / Wayland link flags. See `Cargo.toml` for why that
-//! has to happen here rather than in a consumer.
+//! Vendored copy. Against upstream 0.3.9 two things changed: the desktop-Linux
+//! predicate moved from `target_os = "linux"` to
+//! `all(target_os = "linux", not(target_env = "ohos"))`, so the HarmonyOS triples
+//! (which report `target_os = "linux"`) stop pulling `gpui-pre-linux` and its
+//! X11 / Wayland link flags; and `current_platform` gained explicit arms for
+//! `target_env = "ohos"` and for `target_os = "android"` / `target_os = "ios"`,
+//! which upstream simply leaves unhandled (a missing arm makes the fn body return
+//! `()` and the crate then fails to compile for those triples — enough to break
+//! any consumer that depends on this facade unconditionally). Measured on
+//! `aarch64-linux-android`; the `ios` arm is the same shape but no iOS target is
+//! installed here, so it is unverified. See `Cargo.toml`
+//! for why all of that has to happen here rather than in a consumer.
 
 pub use gpui::Platform;
 
-#[cfg_attr(all(target_os = "linux", target_env = "ohos"), allow(unused_imports))]
+#[cfg_attr(
+    any(
+        all(target_os = "linux", target_env = "ohos"),
+        target_os = "android",
+        target_os = "ios"
+    ),
+    allow(unused_imports)
+)]
 use std::rc::Rc;
 
 /// Returns a background executor for the current platform.
@@ -106,6 +120,23 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
         let _ = headless;
         panic!(
             "gpui_platform::current_platform: HarmonyOS has no desktop platform; use gpui_mobile::ohos::current_platform"
+        )
+    }
+
+    // Android and iOS are the same shape as HarmonyOS: the `Platform` impl lives in
+    // `gpui-pre-mobile` (`gpui_mobile::android::current_platform` / its iOS twin), driven by
+    // the host Activity / UIKit window rather than a display server. This facade cannot reach
+    // it — `gpui-mobile` already pins this crate as a workspace member, so depending back on
+    // `gpui_mobile` here would be a cycle. The arm exists so a consumer that depends on
+    // `gpui_platform` *unconditionally* (gpui-kit gates it behind `cfg(not(any(ios, android)))`,
+    // third-party component libraries typically don't) still cross-compiles for those triples;
+    // calling it is a wiring mistake, so it says so out loud instead of returning a unit value
+    // that would not type-check.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = headless;
+        panic!(
+            "gpui_platform::current_platform: this mobile triple has no desktop platform; use gpui_mobile's own current_platform"
         )
     }
 

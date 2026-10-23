@@ -22,8 +22,9 @@ description = "Zed's `gpui_platform` facade, vendored here so the HarmonyOS trip
 # （gpui-kit 自己也是用 `cfg(not(any(ios, android)))` 才把门面挂上去的，见
 # gpui-kit/crates/kit/Cargo.toml 的 target 段）：鸿蒙上 `gpui-pre-linux` 根本不进图。
 #
-# 除那三条 cfg 之外，源码与上游 0.3.9 那份逐字相同（zed@93d7456 的 gpui_platform 快照）。
-# 哪天上游给三元组加了 ohos 分流，整个成员连同根上那条 patch 一起删。
+# 除上面那两处（桌面 linux 判据收紧 + `current_platform` 给 ohos / android / ios 补臂）之外，
+# 源码与上游 0.3.9 那份逐字相同（zed@93d7456 的 gpui_platform 快照）。
+# 哪天上游给这些三元组加了分流，整个成员连同根上那条 patch 一起删。
 
 [lib]
 name = "gpui_platform"
