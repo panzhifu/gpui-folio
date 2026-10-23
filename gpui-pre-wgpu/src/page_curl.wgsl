@@ -81,11 +81,6 @@ const PI: f32 = 3.141592653589793;
 /// 的深度差约 0.03，还远远吃得下。
 const SHADOW_BIAS: f32 = 0.0045;
 
-/// 卷面根部的压暗深度：纸刚离开页面那一段最暗，往柱顶一路收回纸色原样。
-///
-/// 这是**卷面自己的**接触暗部；平摊页上的投影由下面的 shadow map 给，不在这里乘进去。
-const ROOT_SHADE: f32 = 0.18;
-
 /// 背面透墨的浓度：`0` = 纯纸白，`1` = 把正面照抄到背面。
 ///
 /// 取 0.22：61 号字在白纸上约 0.05，透出来约 0.75 —— 真书上逆光看薄纸的那一档；再淡就没
@@ -286,17 +281,11 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
     // 直线之后，一到两个像素的过渡就够把剩下的锯齿吃掉。
     let w = max(fwidth(past), 1e-4);
 
-    let shadow = sample_shadow(in.light_pos);
     if (past <= -w) {
-        // 平摊那一片：贴折痕一条**软渐变**。参照 Reeden 的仿真翻页：影子是「折痕旁边
-        // 由深到浅的一条带」，宽度约页宽的一成、最深处约 0.84 纸色（真机量到 213/255），
-        // 而不是按投影几何算出来的窄硬边（那张 shadow map 更适合给卷面自己用）。
-        //
-        // 带子从折痕往外铺 `page_size.x * 0.10`；`smoothstep` 让两端都不出硬边。
-        let band = clamp(-past / max(curl.page_size.x * 0.10, 1.0), 0.0, 1.0);
-        let fold_shadow = mix(0.84, 1.0, smoothstep(0.0, 1.0, band));
-        // shadow map 只留一点调制（卷筒投下的那一层），不叠加成第二条深带。
-        return vec4<f32>(paper * fold_shadow * mix(0.94, 1.0, shadow), 1.0);
+        // 平摊那一片就是纸色。从前这里两条一起乘：贴折痕一条 0.84 的软带（宽约页宽一成）
+        // 加 shadow map 的一点调制。卷径起手是页宽的 0.14（应用侧 `curl.rs` 的 `ROLL`），
+        // 那条带跟着一起摊开，读起来像页上压了一块灰 —— 读者报的「阴影好奇怪」就是它。
+        return vec4<f32>(paper, 1.0);
     }
 
     // 卷面法向：圆柱那一条是 `(n·sinθ, cosθ)`；圆锥的半径沿折痕变化，法向还要沿切向
@@ -323,13 +312,9 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
     // 反而掉到 0.69，真机上量到的是卷曲带比纸面还暗（207→192 那个下凹）：受光装反了。
     // N·L 现在只留一点点调制。
     let crest = sin(roll * PI);
-    // 根部压暗：`height = 1 − cos θ` 归一的就是「纸离页多高」（`z = R·height`）。折痕处
-    // `height = 0` ⇒ 一点不压，抬到柱面中段最深，再往柱顶收 —— 与 harism 那句
-    // `mColorFactor = .1 + .9·sqrt(...)` 同一个形状：暗部跟着**抬起高度**走，不是贴在折痕上。
-    let height = 1.0 - cos(theta);
-    let root = ROOT_SHADE * height * clamp(1.0 - roll * 1.5, 0.0, 1.0);
-    let front = paper * (1.0 + 0.10 * crest + 0.05 * (diffuse / light_z - 1.0) * (1.0 - crest)
-        - root);
+    // 根部压暗（`ROOT_SHADE · (1 − cos θ)`，折痕处不压、柱面中段最深）撤了：卷面的明暗
+    // 只留柱顶那道亮脊与那一丁点 N·L 调制。
+    let front = paper * (1.0 + 0.10 * crest + 0.05 * (diffuse / light_z - 1.0) * (1.0 - crest));
 
     // 背面 = 接近纸白 + **正面这一页的墨透过来**，再只在贴着柱顶那一窄条压一道内侧影。
     // 参照里那句「整片 ×0.92、内侧再 ×0.82」在真机上量到 192 / 235 两档，摊开成一条三百多
@@ -362,11 +347,9 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
     let curled = mix(back, front, side);
     // 平摊 ↔ 卷起：位置在这里连续（`u` 两侧都等于 `past`），换的只有受光与内容那一档。
     let rim = vec3<f32>(0.06 * (1.0 - smoothstep(0.0, 2.0, in.edge)));
-    // 卷面自己也在 shadow map 里：抬得越高、越靠近另一页，越暗。平摊那一侧用同一个
-    // shadow 采样（`0.62` 的底部比卷面深一点，影落在纸上比落在纸上再落影更重）。
-    // 卷面自己也被 shadow map 压：抬得越高、越靠近另一页，越暗。压得很浅（0.94），
-    // 免得读成「阴影盖在纸上面」—— 卷面的明暗主要交给 `crest` / `root` 那一套。
-    let lit = (curled + rim) * mix(0.94, 1.0, shadow);
-    let flat = paper * mix(0.86, 1.0, shadow);
+    // 两样都不再乘 shadow map 那一道：卷面的压暗与平摊页上的投影撤干净，接缝两侧只差
+    // `crest` / `rim` 那一档受光。
+    let lit = curled + rim;
+    let flat = paper;
     return vec4<f32>(mix(flat, lit, smoothstep(-w, w, past)), 1.0);
 }
