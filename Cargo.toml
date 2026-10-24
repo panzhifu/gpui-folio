@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["gpui-pre", "gpui-pre-wgpu", "gpui-pre-platform", "folio-curl"]
+members = ["gpui-pre", "gpui-pre-wgpu", "gpui-pre-platform", "folio-curl", "gpui-pre-apple", "gpui-pre-windows"]
 
 # 这棵分叉树原先只为一件事：给 folio 的仿真翻页补上
 #   - 自定义网格 primitive（页面纹理的圆柱形变）

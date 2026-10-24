@@ -2135,6 +2135,46 @@ dependencies = [
 [[package]]
 name = "gpui-pre-apple"
 version = "0.3.9"
+dependencies = [
+ "anyhow",
+ "async-task",
+ "block2 0.6.2",
+ "cbindgen",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "core-graphics 0.24.0",
+ "core-text",
+ "derive_more",
+ "dispatch2",
+ "etagere",
+ "foreign-types",
+ "futures",
+ "gpui-pre",
+ "gpui-pre-collections",
+ "gpui-pre-util",
+ "image",
+ "libc",
+ "log",
+ "mach2",
+ "metal",
+ "objc2 0.6.5",
+ "objc2-core-foundation",
+ "objc2-core-text",
+ "objc2-core-video",
+ "objc2-foundation 0.3.2",
+ "objc2-metal 0.3.2",
+ "objc2-quartz-core 0.3.2",
+ "objc2-security",
+ "parking_lot",
+ "pathfinder_geometry",
+ "smallvec",
+ "thiserror 2.0.21",
+ "zed-font-kit",
+]
+
+[[package]]
+name = "gpui-pre-apple"
+version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b52f58893fe1a0836464428dfad2b5eaf42c9c303a9638f4c2aced5a69072a15"
 dependencies = [
@@ -2291,7 +2331,7 @@ dependencies = [
  "foreign-types",
  "futures",
  "gpui-pre",
- "gpui-pre-apple",
+ "gpui-pre-apple 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "gpui-pre-collections",
  "gpui-pre-scheduler",
  "gpui-pre-util",
@@ -2339,7 +2379,7 @@ dependencies = [
  "gpui-pre-macos",
  "gpui-pre-web",
  "gpui-pre-wgpu",
- "gpui-pre-windows",
+ "gpui-pre-windows 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -2456,6 +2496,35 @@ dependencies = [
  "web-sys",
  "wgpu",
  "zed-font-kit",
+]
+
+[[package]]
+name = "gpui-pre-windows"
+version = "0.3.9"
+dependencies = [
+ "accesskit",
+ "accesskit_windows",
+ "anyhow",
+ "dunce",
+ "etagere",
+ "futures",
+ "gpui-pre",
+ "gpui-pre-collections",
+ "gpui-pre-scheduler",
+ "gpui-pre-util",
+ "image",
+ "itertools 0.14.0",
+ "log",
+ "parking_lot",
+ "rand 0.9.5",
+ "raw-window-handle",
+ "smallvec",
+ "uuid",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+ "windows-numerics 0.3.1",
+ "windows-registry",
+ "zed-scap",
 ]
 
 [[package]]
