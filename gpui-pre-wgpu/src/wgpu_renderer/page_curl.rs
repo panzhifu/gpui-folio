@@ -89,6 +89,11 @@ pub(super) struct PageCurlPipelines {
     mesh: wgpu::RenderPipeline,
     /// 卷起那一片纸落在下面那页上的投影：同一套顶点与索引，另一条 pipeline。
     shadow: wgpu::RenderPipeline,
+    /// 正面与背面两张捕获纹理共用的那一组布局：一组四个绑定（两张纹理各带一个采样器）。
+    /// 单独存是因为 `WgpuBindGroupLayouts.texture` 只装一对纹理+采样器，装不下两张；
+    /// 而合组是硬要求 —— 适配器只报 4 组时（Adreno 的 Vulkan 驱动实测），五组的
+    /// 管线布局让 `create_shader_module` 当场验证失败，整个 Vulkan 设备被拒。
+    capture_pair_layout: wgpu::BindGroupLayout,
 }
 
 pub(super) fn create_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -193,6 +198,48 @@ pub(super) fn create_pipelines(
         bias: wgpu::DepthBiasState::default(),
     };
 
+    // 正面捕获与背面捕获合用 group 2（四个绑定），shadow map 独占 group 3：
+    // 连同 globals 与 uniforms 一共 4 组，贴着最抠门的适配器（max_bind_groups = 4，
+    // Adreno 的 Vulkan 驱动实测）的天花板。原先 back 单独占 group 4，第五组一超，
+    // 着色器模块验证失败，Vulkan 整个设备被拒、全应用退到 GL。
+    let capture_pair_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("page_curl_capture_pair_layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+
     // 片元给回的 alpha 恒为 1，这一趟本来就是不透明的：开着混合只是让整页多一次读改写。
     let mesh = create(
         "page_curl_mesh",
@@ -201,9 +248,8 @@ pub(super) fn create_pipelines(
         &[
             Some(&layouts.globals),
             Some(&layouts.page_curl_uniforms),
-            Some(&layouts.texture),
-            // group 3：光源方向的 shadow map；group 4：下一跨页背面的捕获纹理。
-            Some(&layouts.texture),
+            // group 2：正面与背面两张捕获纹理并作一组；group 3：光源方向的 shadow map。
+            Some(&capture_pair_layout),
             Some(&layouts.texture),
         ],
         target_format,
@@ -229,13 +275,16 @@ pub(super) fn create_pipelines(
         None,
     );
 
-    PageCurlPipelines { mesh, shadow }
+    PageCurlPipelines {
+        mesh,
+        shadow,
+        capture_pair_layout,
+    }
 }
 
 struct CaptureTexture {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
-    bind_group: wgpu::BindGroup,
     size: Size<DevicePixels>,
 }
 
@@ -280,6 +329,9 @@ pub(super) struct PageCurlResources {
     sampler: wgpu::Sampler,
     capture: Option<CaptureTexture>,
     back_capture: Option<CaptureTexture>,
+    /// 正面与背面两张捕获纹理并成的**一张** bind group（group 2，四绑定）。两张纹理
+    /// 谁（重）建了它都得跟着重建 —— 见 [`PageCurlResources::refresh_capture_pair`]。
+    capture_pair_bind_group: Option<wgpu::BindGroup>,
     depth: Option<DepthTexture>,
     shadow: Option<ShadowTexture>,
     geometry: Option<GeometryCache>,
@@ -327,6 +379,7 @@ impl PageCurlResources {
             sampler,
             capture: None,
             back_capture: None,
+            capture_pair_bind_group: None,
             depth: None,
             shadow: None,
             geometry: None,
@@ -338,6 +391,7 @@ impl PageCurlResources {
     pub(super) fn invalidate_size_dependent(&mut self) {
         self.capture = None;
         self.back_capture = None;
+        self.capture_pair_bind_group = None;
         self.depth = None;
         self.geometry = None;
         self.frame = None;
@@ -508,7 +562,7 @@ impl PageCurlResources {
     pub(super) fn capture_view(
         &mut self,
         device: &wgpu::Device,
-        layouts: &WgpuBindGroupLayouts,
+        _layouts: &WgpuBindGroupLayouts,
         size: Size<DevicePixels>,
     ) -> &wgpu::TextureView {
         let needs_new = self
@@ -534,26 +588,12 @@ impl PageCurlResources {
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("page_capture_bind_group"),
-                layout: &layouts.texture,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
             self.capture = Some(CaptureTexture {
                 _texture: texture,
                 view,
-                bind_group,
                 size,
             });
+            self.refresh_capture_pair(device);
         }
         &self.capture.as_ref().unwrap().view
     }
@@ -562,7 +602,7 @@ impl PageCurlResources {
     pub(super) fn back_capture_view(
         &mut self,
         device: &wgpu::Device,
-        layouts: &WgpuBindGroupLayouts,
+        _layouts: &WgpuBindGroupLayouts,
         size: Size<DevicePixels>,
     ) -> &wgpu::TextureView {
         let needs_new = self
@@ -588,28 +628,48 @@ impl PageCurlResources {
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("page_capture_back_bind_group"),
-                layout: &layouts.texture,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
             self.back_capture = Some(CaptureTexture {
                 _texture: texture,
                 view,
-                bind_group,
                 size,
             });
+            self.refresh_capture_pair(device);
         }
         &self.back_capture.as_ref().unwrap().view
+    }
+
+    /// 正面与背面两张捕获纹理并成一张 bind group（group 2 的四个绑定）。
+    ///
+    /// 在任一张捕获纹理（重）建之后调：两张纹理都到位才建得出来，所以第一帧只建出
+    /// 正面那一半时先欠着，背面到位的那次调用把它补上。谁重建纹理谁就得重建这张组 ——
+    /// 旧的 view 一 drop，组里攥着的引用就悬了。尺寸没变时一个字节都不动。
+    fn refresh_capture_pair(&mut self, device: &wgpu::Device) {
+        let (Some(capture), Some(back)) = (&self.capture, &self.back_capture) else {
+            return;
+        };
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("page_capture_pair_bind_group"),
+            layout: &self.pipelines.capture_pair_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&capture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&back.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        self.capture_pair_bind_group = Some(bind_group);
     }
 
     fn ensure_depth(&mut self, device: &wgpu::Device, size: Size<DevicePixels>) {
@@ -659,16 +719,13 @@ impl PageCurlResources {
         // 缺绑定而跳过」，而它正是那条黑的来源：尺寸一变（`invalidate_size_dependent` 把纹理清了）
         // 或者翻页赶在烘纹理之前，整片纸就读成黑。跳过只是「这一趟没卷起来」—— 下面那张页本来
         // 就在那儿，读起来是一次普通的落定；绑黑读起来是屏幕上一条黑带。
-        let Some(capture) = self.capture.as_ref() else {
+        //
+        // 合组那张 bind group 只在**两张**捕获纹理都到位时才建得出来（见
+        // `refresh_capture_pair`），缺它就是某一半还没烘出来，与缺单张同一条退路。
+        let Some(capture_pair) = self.capture_pair_bind_group.as_ref() else {
             log::debug!("page_curl: 缺捕获纹理，这一帧不画卷曲网格");
             return;
         };
-        let capture_bind_group = &capture.bind_group;
-        let Some(back_capture) = self.back_capture.as_ref() else {
-            log::debug!("page_curl: 缺背面捕获纹理，这一帧不画卷曲网格");
-            return;
-        };
-        let back_capture_bind_group = &back_capture.bind_group;
 
         let b = frame.page_bounds;
         let x = b.origin.x.0.max(0.0) as u32;
@@ -718,9 +775,8 @@ impl PageCurlResources {
         pass.set_pipeline(&self.pipelines.mesh);
         pass.set_bind_group(0, globals_bind_group, &[]);
         pass.set_bind_group(1, &self.uniform_bind_group, &[]);
-        pass.set_bind_group(2, capture_bind_group, &[]);
+        pass.set_bind_group(2, capture_pair, &[]);
         pass.set_bind_group(3, &shadow.bind_group, &[]);
-        pass.set_bind_group(4, back_capture_bind_group, &[]);
         pass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
         pass.set_index_buffer(geometry.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..frame.index_count, 0, 0..1);
