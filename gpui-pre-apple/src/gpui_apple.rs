@@ -8,6 +8,7 @@
 mod dispatcher;
 pub mod keychain;
 mod metal_atlas;
+mod page_curl;
 pub mod metal_renderer;
 pub mod thermal;
 

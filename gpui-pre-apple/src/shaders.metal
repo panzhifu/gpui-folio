@@ -1277,3 +1277,286 @@ float4 fill_color(Background background,
 
   return color;
 }
+
+// ---- 页面卷曲（page curl）----
+//
+// WGSL 母本在 gpui-pre-wgpu/src/page_curl.wgsl，这段是它的 MSL 直译。截面三段、
+// 逐像素折线判据、背面透墨与柱顶亮脊的口径全部沿用母本（那边的注释是真机调校
+// 攒下来的，不在这边重复）。MSL 侧只有两处差异要记：
+//   - uniform 的字节布局与 Rust 侧 GpuCurlUniforms（240 字节）逐格对应，[f32;3]
+//     补位格写成 C 数组 —— MSL 的 float3 是 16 字节对齐，直接用会多出 4 字节空洞。
+//   - 绑定表是本段私有的：buffer(0) 顶点、buffer(1) uniform、buffer(2) viewport、
+//     texture(0) 正面捕获、texture(1) shadow map、texture(2) 背面捕获。
+
+constant float PAGE_CURL_PI = 3.141592653589793;
+// 阴影比较的偏置：8 位 shadow map 一档 = 1/255 ≈ 0.0039，取一档多一点，
+// 平面与自己比就不会被量化误差判成在影里。
+constant float PAGE_CURL_SHADOW_BIAS = 0.0045;
+// 背面透墨浓度：0 = 纯纸白，1 = 把正面照抄到背面。取 0.34（母本同款）。
+constant float PAGE_CURL_BLEED = 0.34;
+
+struct CurlGpuUniforms {
+  float2 page_origin;          //   0
+  float2 page_size;            //   8
+  float2 window_size;          //  16
+  float2 axis_normal;          //  24
+  float axis_d;                //  32
+  float radius;                //  36
+  float camera_distance;       //  40
+  float scale_factor;          //  44
+  float4 back_color;           //  48
+  float4 light_dir;            //  64
+  float4 cone_a;               //  80
+  float4 cone_b;               //  96
+  float2 capture_origin;       // 112
+  float2 _padding;             // 120
+  float shadow_map_size;       // 128
+  float _pad0[3];              // 132
+  float _pad1[3];              // 144
+  float _pad1a;                // 156
+  float4x4 light_view_proj;    // 160
+  float2 back_capture_origin;  // 224
+  float2 _pad2;                // 232
+};
+
+struct PageCurlVertexIn {
+  float2 position;  // 页面局部逻辑像素
+  float2 uv;        // 页面纹理坐标 0..1
+};
+
+struct PageCurlVertexOut {
+  float4 position [[position]];
+  float2 uv [[user(locn0)]];
+  float3 normal [[user(locn1)]];
+  float past [[user(locn2)]];
+  float edge [[user(locn3)]];
+  float back_fade [[user(locn4)]];
+  float2 material [[user(locn5)]];
+  float4 light_pos [[user(locn6)]];
+};
+
+// 折痕切向坐标 s 处的卷径：cone_weight = 0 即圆柱，否则半径从锥顶 0 线性长到自由边。
+static float page_curl_radius_at(thread const CurlGpuUniforms &curl, float2 p) {
+  float2 n = curl.axis_normal;
+  float2 tangent = float2(-n.y, n.x);
+  float s = dot(tangent, p);
+  float denom = curl.cone_a.y - curl.cone_a.x;
+  float denom_safe = abs(denom) > 1.0 ? denom : 1.0;
+  float cone = clamp(curl.radius * (s - curl.cone_a.x) / denom_safe,
+                     curl.cone_a.w, curl.cone_b.x);
+  return max(mix(curl.radius, cone, clamp(curl.cone_a.z, 0.0, 1.0)), 0.001);
+}
+
+struct PageCurlDeformed {
+  float3 position;
+  float3 normal;
+  float past;
+  float back_fade;
+};
+
+static PageCurlDeformed page_curl_deform(thread const CurlGpuUniforms &curl,
+                                         float2 page_position) {
+  float2 p = page_position * curl.scale_factor;
+  float2 n = curl.axis_normal;
+  float d = dot(n, p) - curl.axis_d;
+  float r = page_curl_radius_at(curl, p);
+
+  float u;
+  float z;
+  float3 normal;
+  float back_fade = 0.0;
+
+  if (d <= 0.0) {
+    // 平摊：横坐标就是它自己。
+    u = d;
+    z = 0.0;
+    normal = float3(0.0, 0.0, 1.0);
+  } else if (d < PAGE_CURL_PI * r) {
+    // 卷在柱面上：走过的弧长就是 d。
+    float theta = d / r;
+    u = r * sin(theta);
+    z = r * (1.0 - cos(theta));
+    normal = float3(n * sin(theta), cos(theta));
+  } else {
+    // 绕过柱顶，落在 z = 2R 的背面平面。
+    u = PAGE_CURL_PI * r - d;
+    z = 2.0 * r;
+    normal = float3(0.0, 0.0, -1.0);
+    back_fade = clamp((d / r - PAGE_CURL_PI) / 1.5, 0.0, 1.0);
+  }
+
+  // 弱透视：相机在页面上方，抬得越高离读者越近、投影越大。
+  float scale = curl.camera_distance / max(curl.camera_distance - z, 1.0);
+  float2 axis_foot = p - n * d;
+  float2 center = curl.page_size * 0.5;
+  float2 tangent = float2(-n.y, n.x);
+  float v_rel = dot(tangent, axis_foot - center);
+  float2 world2 = curl.page_origin + axis_foot
+      + tangent * (v_rel * (scale - 1.0)) + n * (u * scale);
+
+  return PageCurlDeformed{float3(world2, z), normal, d, back_fade};
+}
+
+static float4 page_curl_to_device(float2 position, float depth,
+                                  constant Size_DevicePixels *viewport_size) {
+  float2 viewport = float2(float(viewport_size->width), float(viewport_size->height));
+  float2 ndc = position / viewport * float2(2.0, -2.0) + float2(-1.0, 1.0);
+  return float4(ndc, depth, 1.0);
+}
+
+vertex PageCurlVertexOut vs_page_curl(uint vertex_id [[vertex_id]],
+                                      constant PageCurlVertexIn *vertices [[buffer(0)]],
+                                      constant CurlGpuUniforms *curl [[buffer(1)]],
+                                      constant Size_DevicePixels *viewport_size [[buffer(2)]]) {
+  PageCurlDeformed def = page_curl_deform(*curl, vertices[vertex_id].position);
+  PageCurlVertexOut out;
+  // 深度：抬得越高越靠近读者 ⇒ 深度值越小，背面（z = 2R）压住平摊页（z = 0）。
+  float depth = clamp(1.0 - def.position.z / curl->camera_distance, 0.0, 1.0);
+  out.position = page_curl_to_device(def.position.xy, depth, viewport_size);
+  // 采样坐标按窗口归一、用烘时的 capture_origin；几何摆本帧的 page_origin。
+  out.uv = (curl->capture_origin + vertices[vertex_id].position * curl->scale_factor)
+      / curl->window_size;
+  out.normal = def.normal;
+  out.past = def.past;
+  out.back_fade = def.back_fade;
+  // 材质坐标原样带下去：片元要靠它把「这一像素是页上的哪一点」逐像素问回来。
+  out.material = vertices[vertex_id].uv;
+  float2 local = vertices[vertex_id].position * curl->scale_factor;
+  out.edge = min(min(local.x, curl->page_size.x - local.x),
+                 min(local.y, curl->page_size.y - local.y));
+  out.light_pos = curl->light_view_proj * float4(def.position, 1.0);
+  return out;
+}
+
+struct PageCurlShadowVertexOut {
+  float4 position [[position]];
+  float depth [[user(locn0)]];
+};
+
+// 深度趟：把同一张网格从光源方向渲进 shadow map。
+vertex PageCurlShadowVertexOut vs_page_curl_shadow(
+    uint vertex_id [[vertex_id]],
+    constant PageCurlVertexIn *vertices [[buffer(0)]],
+    constant CurlGpuUniforms *curl [[buffer(1)]]) {
+  PageCurlDeformed def = page_curl_deform(*curl, vertices[vertex_id].position);
+  PageCurlShadowVertexOut out;
+  out.position = curl->light_view_proj * float4(def.position, 1.0);
+  out.depth = out.position.z / out.position.w;
+  return out;
+}
+
+struct PageCurlShadowFragmentOut {
+  float4 color [[color(0)]];
+  // 同时写进深度附件：8 位颜色目标又不保证三角形从近到远，只有让深度测试
+  // 用同一个数，颜色里留下的才是「离光源最近」的那一个。
+  float depth [[depth(any)]];
+};
+
+fragment PageCurlShadowFragmentOut fs_page_curl_shadow(PageCurlShadowVertexOut in [[stage_in]]) {
+  PageCurlShadowFragmentOut out;
+  out.color = float4(in.depth, 0.0, 0.0, 1.0);
+  out.depth = in.depth;
+  return out;
+}
+
+// 3×3 PCF：0 = 完全在影里，1 = 完全受光。
+static float page_curl_sample_shadow(
+    thread const CurlGpuUniforms &curl,
+    float4 light_pos,
+    texture2d<float> shadow_texture,
+    sampler shadow_sampler) {
+  float3 ndc = light_pos.xyz / light_pos.w;
+  float2 uv = ndc.xy * float2(0.5, -0.5) + float2(0.5, 0.5);
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+    return 1.0;
+  }
+  float texel = 1.0 / max(curl.shadow_map_size, 1.0);
+  float lit = 0.0;
+  for (int y = -1; y <= 1; y = y + 1) {
+    for (int x = 1; x >= -1; x = x - 1) {
+      float2 offset = float2(float(x), float(y)) * texel;
+      float stored = shadow_texture.sample(shadow_sampler, uv + offset).r;
+      float shadowed = (ndc.z > stored + PAGE_CURL_SHADOW_BIAS) ? 0.0 : 1.0;
+      lit = lit + shadowed;
+    }
+  }
+  return lit / 9.0;
+}
+
+struct PageCurlFragmentOut {
+  float4 color [[color(0)]];
+};
+
+fragment PageCurlFragmentOut fs_page_curl(
+    PageCurlVertexOut in [[stage_in]],
+    constant CurlGpuUniforms *curl [[buffer(1)]],
+    texture2d<float> capture_texture [[texture(0)]],
+    texture2d<float> shadow_texture [[texture(1)]],
+    texture2d<float> back_texture [[texture(2)]],
+    sampler capture_sampler [[sampler(0)]],
+    sampler shadow_sampler [[sampler(1)]],
+    sampler back_sampler [[sampler(2)]]) {
+  // 捕获纹理整窗大小、只有页面矩形那块被写过：取 uv 往矩形内收半像素。
+  float2 uv_min = (curl->capture_origin + float2(0.5)) / curl->window_size;
+  float2 uv_max = (curl->capture_origin + curl->page_size - float2(0.5)) / curl->window_size;
+  float2 capture_uv = clamp(in.uv, uv_min, uv_max);
+  // 全场唯一一次正面采样。
+  float3 paper = capture_texture.sample(capture_sampler, capture_uv, level(0)).rgb;
+
+  // past 不用顶点插值的那一份，从材质坐标逐像素现算 —— 等值线才是解析直线
+  // （母本注释里有真机量出来的台阶案例）。
+  float2 local = in.material * curl->page_size;
+  float r = page_curl_radius_at(*curl, local);
+  float past = dot(curl->axis_normal, local) - curl->axis_d;
+  float theta = past / r;
+  float w = max(fwidth(past), 1e-4);
+
+  if (past <= -w) {
+    // 平摊那一片就是纸色，不做任何明暗处理。
+    PageCurlFragmentOut out;
+    out.color = float4(paper, 1.0);
+    return out;
+  }
+
+  // 卷面法向：圆柱是 (n·sinθ, cosθ)；圆锥的半径沿折痕变化，法向沿切向偏
+  // r'(s)·(cosθ−1)，θ=0 处不偏，往背面一路增大。
+  float cone_denom = curl->cone_a.y - curl->cone_a.x;
+  float r_prime = abs(cone_denom) > 1.0 ? curl->cone_a.z * curl->radius / cone_denom : 0.0;
+  float2 tangent = float2(-curl->axis_normal.y, curl->axis_normal.x);
+  float3 n = normalize(
+      float3(curl->axis_normal * sin(theta), cos(theta))
+      + float3(tangent, 0.0) * (r_prime * (cos(theta) - 1.0)));
+  float3 light = normalize(curl->light_dir.xyz);
+  float diffuse = max(dot(n, light), 0.0);
+  float light_z = max(light.z, 0.001);
+  // 归一化弧长：0 = 贴着折线，0.5 = 柱顶，1 = 落到背面。
+  float roll = clamp(past / (PAGE_CURL_PI * r), 0.0, 1.0);
+  // 柱顶亮脊是「纸有厚度」的主要线索；N·L 只留一点点调制。
+  float crest = sin(roll * PAGE_CURL_PI);
+  float3 front = paper * (1.0 + 0.10 * crest
+      + 0.05 * (diffuse / light_z - 1.0) * (1.0 - crest));
+
+  // 背面 = 纸白 + 正面的墨透过来（BLEED），只在贴着柱顶那一窄条压内侧影。
+  // 采的仍是正面捕获纹理，材质坐标不镜像 —— 几何的镜像已经把它投回来了。
+  float2 bleed_uv = (curl->capture_origin + in.material * curl->page_size)
+      / curl->window_size;
+  float3 bleed = capture_texture.sample(capture_sampler,
+      clamp(bleed_uv, uv_min, uv_max), level(0)).rgb;
+  float back_fade = clamp((theta - PAGE_CURL_PI) / 1.5, 0.0, 1.0);
+  float3 back = (curl->back_color.rgb + (bleed - curl->back_color.rgb) * PAGE_CURL_BLEED)
+      * mix(0.985, 1.0, min(back_fade * 6.0, 1.0));
+
+  // 正面 ↔ 背面：θ = π/2 那一点法向过零，用现算 past 做两像素过渡。
+  float turn = PAGE_CURL_PI * r * 0.5;
+  float side = clamp(0.5 + (turn - past) / (2.0 * w), 0.0, 1.0);
+  float3 curled = mix(back, front, side);
+  // 纸边光。
+  float3 rim = float3(0.06 * (1.0 - smoothstep(0.0, 2.0, in.edge)));
+  // 两样都不再乘 shadow map 那一道：卷面的压暗与平摊页上的投影撤干净，接缝两侧
+  // 只差 crest / rim 那一档受光（母本同口径 —— 投影是几何自己那趟独立网格）。
+  float3 lit = curled + rim;
+  float3 flat_color = paper;
+  PageCurlFragmentOut out;
+  out.color = float4(mix(flat_color, lit, smoothstep(-w, w, past)), 1.0);
+  return out;
+}
