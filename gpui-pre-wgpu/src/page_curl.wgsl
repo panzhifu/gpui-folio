@@ -66,14 +66,17 @@ struct CurlUniforms {
 
 @group(1) @binding(0) var<uniform> curl: CurlUniforms;
 
+// 正面捕获与背面捕获挤进同一组：适配器报的 max_bind_groups 有只有 4 的（Adreno 的
+// Vulkan 驱动实测），globals + uniforms + 两张捕获 + shadow map 一共 5 组就超了一格，
+// 超一格不是某一趟画不出，而是 create_shader_module 当场验证失败、整个 Vulkan 设备
+// 被拒、全应用退到 GL。四绑定一组把总数压回 4。
 @group(2) @binding(0) var capture_texture: texture_2d<f32>;
 @group(2) @binding(1) var capture_sampler: sampler;
+@group(2) @binding(2) var back_texture: texture_2d<f32>;
+@group(2) @binding(3) var back_sampler: sampler;
 
 @group(3) @binding(0) var shadow_texture: texture_2d<f32>;
 @group(3) @binding(1) var shadow_sampler: sampler;
-
-@group(4) @binding(0) var back_texture: texture_2d<f32>;
-@group(4) @binding(1) var back_sampler: sampler;
 
 const PI: f32 = 3.141592653589793;
 /// 阴影比较的偏置。颜色目标是 8 位，一档 = 1/255 ≈ 0.0039；偏置小于半档时，平面与
