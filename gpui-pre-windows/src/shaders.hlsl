@@ -1266,3 +1266,264 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
 }
+
+// ---- 页面卷曲（page curl）----
+//
+// WGSL 母本在 gpui-pre-wgpu/src/page_curl.wgsl，这段是它的 HLSL 直译（与
+// gpui-pre-apple/src/shaders.metal 的 MSL 直译同一份口径）。差异两条：
+//   - cbuffer 的 [f32;3] 补位格必须展开成标量：HLSL cbuffer 里数组每元素
+//     按 16 字节对齐，三个 float 会吃掉 48 字节，把后面全顶错。
+//   - 绑定表本段私有：t1 顶点（StructuredBuffer，DrawIndexed 的 vertex_id
+//     就是索引值）、b2 uniform、t2 正面捕获、t3 shadow map、t4 背面捕获、
+//     s1 最近邻采样器。
+
+cbuffer CurlUniforms : register(b2) {
+    float2 cu_page_origin;      //   0
+    float2 cu_page_size;        //   8
+    float2 cu_window_size;      //  16
+    float2 cu_axis_normal;      //  24
+    float  cu_axis_d;           //  32
+    float  cu_radius;           //  36
+    float  cu_camera_distance;  //  40
+    float  cu_scale_factor;     //  44
+    float4 cu_back_color;       //  48
+    float4 cu_light_dir;        //  64
+    float4 cu_cone_a;           //  80
+    float4 cu_cone_b;           //  96
+    float2 cu_capture_origin;   // 112
+    float2 cu__padding;         // 120
+    float  cu_shadow_map_size;  // 128
+    float  cu__pad0;            // 132
+    float  cu__pad1;            // 136
+    float  cu__pad2;            // 140
+    float  cu__pad3;            // 144
+    float  cu__pad4;            // 148
+    float  cu__pad5;            // 152
+    float  cu__pad6;            // 156
+    float4x4 cu_light_view_proj; // 160
+    float2 cu_back_capture_origin; // 224
+    float2 cu__pad7;            // 232
+};
+
+struct PageCurlVertexIn {
+    float2 position;
+    float2 uv;
+};
+
+StructuredBuffer<PageCurlVertexIn> vertices_page_curl : register(t1);
+// 视口单独一小格（16 字节对齐的 cbuffer）：DrawIndexed 的 vertex_id 就是索引值，
+// 顶点按索引从上面那条 StructuredBuffer 拉。
+cbuffer CurlViewport : register(b3) {
+    float2 curl_viewport;
+    float2 curl_viewport_pad;
+};
+
+struct PageCurlVertexOutput {
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+    float3 normal : TEXCOORD1;
+    float past : TEXCOORD2;
+    float edge : TEXCOORD3;
+    float back_fade : TEXCOORD4;
+    float2 material : TEXCOORD5;
+    float4 light_pos : TEXCOORD6;
+};
+
+Texture2D<float4> t_page_capture : register(t2);
+Texture2D<float4> t_page_shadow : register(t3);
+Texture2D<float4> t_page_back : register(t4);
+SamplerState s_page_curl : register(s1);
+
+static const float PAGE_CURL_PI = 3.141592653589793;
+// 8 位 shadow map 一档 = 1/255 ≈ 0.0039，偏置取一档多一点避免自阴影噪点。
+static const float PAGE_CURL_SHADOW_BIAS = 0.0045;
+// 背面透墨浓度：0 = 纯纸白，1 = 把正面照抄到背面。
+static const float PAGE_CURL_BLEED = 0.34;
+
+float page_curl_radius_at(float2 p) {
+    float2 tangent = float2(-cu_axis_normal.y, cu_axis_normal.x);
+    float s = dot(tangent, p);
+    float denom = cu_cone_a.y - cu_cone_a.x;
+    float denom_safe = abs(denom) > 1.0 ? denom : 1.0;
+    float cone = clamp(cu_radius * (s - cu_cone_a.x) / denom_safe,
+                       cu_cone_a.w, cu_cone_b.x);
+    return max(mix(cu_radius, cone, clamp(cu_cone_a.z, 0.0, 1.0)), 0.001);
+}
+
+static void page_curl_deform(float2 page_position, out float3 position,
+                             out float3 normal, out float past,
+                             out float back_fade) {
+    float2 p = page_position * cu_scale_factor;
+    float2 n = cu_axis_normal;
+    float d = dot(n, p) - cu_axis_d;
+    float r = page_curl_radius_at(p);
+
+    float u;
+    float z;
+    back_fade = 0.0;
+
+    if (d <= 0.0) {
+        // 平摊：横坐标就是它自己。
+        u = d;
+        z = 0.0;
+        normal = float3(0.0, 0.0, 1.0);
+    } else if (d < PAGE_CURL_PI * r) {
+        // 卷在柱面上：走过的弧长就是 d。
+        float theta = d / r;
+        u = r * sin(theta);
+        z = r * (1.0 - cos(theta));
+        normal = float3(n * sin(theta), cos(theta));
+    } else {
+        // 绕过柱顶，落在 z = 2R 的背面平面。
+        u = PAGE_CURL_PI * r - d;
+        z = 2.0 * r;
+        normal = float3(0.0, 0.0, -1.0);
+        back_fade = clamp((d / r - PAGE_CURL_PI) / 1.5, 0.0, 1.0);
+    }
+
+    // 弱透视：相机在页面上方，抬得越高离读者越近、投影越大。
+    float scale = cu_camera_distance / max(cu_camera_distance - z, 1.0);
+    float2 axis_foot = p - n * d;
+    float2 center = cu_page_size * 0.5;
+    float2 tangent = float2(-n.y, n.x);
+    float v_rel = dot(tangent, axis_foot - center);
+    float2 world2 = cu_page_origin + axis_foot
+        + tangent * (v_rel * (scale - 1.0)) + n * (u * scale);
+
+    position = float3(world2, z);
+    past = d;
+}
+
+static float4 page_curl_to_device(float2 position, float depth) {
+    float2 ndc = position / curl_viewport * float2(2.0, -2.0) + float2(-1.0, 1.0);
+    return float4(ndc, depth, 1.0);
+}
+
+PageCurlVertexOutput page_curl_vertex(uint vertex_id : SV_VertexID) {
+    PageCurlVertexIn input = vertices_page_curl[vertex_id];
+    float3 position;
+    float3 normal;
+    float past;
+    float back_fade;
+    page_curl_deform(input.position, position, normal, past, back_fade);
+
+    PageCurlVertexOutput output;
+    // 深度：抬得越高越靠近读者 ⇒ 深度值越小，背面（z = 2R）压住平摊页。
+    float depth = clamp(1.0 - position.z / cu_camera_distance, 0.0, 1.0);
+    output.position = page_curl_to_device(position.xy, depth);
+    // 采样坐标按窗口归一、用烘时的 capture_origin；几何摆本帧的 page_origin。
+    output.uv = (cu_capture_origin + input.position * cu_scale_factor) / cu_window_size;
+    output.normal = normal;
+    output.past = past;
+    output.back_fade = back_fade;
+    output.material = input.uv;
+    float2 local = input.position * cu_scale_factor;
+    output.edge = min(min(local.x, cu_page_size.x - local.x),
+                      min(local.y, cu_page_size.y - local.y));
+    output.light_pos = mul(cu_light_view_proj, float4(position, 1.0));
+    return output;
+}
+
+struct PageCurlShadowVertexOutput {
+    float4 position : SV_Position;
+    float depth : TEXCOORD0;
+};
+
+PageCurlShadowVertexOutput page_curl_shadow_vertex(uint vertex_id : SV_VertexID) {
+    PageCurlVertexIn input = vertices_page_curl[vertex_id];
+    float3 position;
+    float3 normal;
+    float past;
+    float back_fade;
+    page_curl_deform(input.position, position, normal, past, back_fade);
+
+    PageCurlShadowVertexOutput output;
+    output.position = mul(cu_light_view_proj, float4(position, 1.0));
+    output.depth = output.position.z / output.position.w;
+    return output;
+}
+
+struct PageCurlShadowFragmentOutput {
+    float4 color : SV_Target0;
+    float depth : SV_Depth;
+};
+
+PageCurlShadowFragmentOutput page_curl_shadow_fragment(PageCurlShadowVertexOutput input) {
+    PageCurlShadowFragmentOutput output;
+    output.color = float4(input.depth, 0.0, 0.0, 1.0);
+    output.depth = input.depth;
+    return output;
+}
+
+// 3×3 PCF：0 = 完全在影里，1 = 完全受光。
+float page_curl_sample_shadow(float4 light_pos) {
+    float3 ndc = light_pos.xyz / light_pos.w;
+    float2 uv = ndc.xy * float2(0.5, -0.5) + float2(0.5, 0.5);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        return 1.0;
+    }
+    float texel = 1.0 / max(cu_shadow_map_size, 1.0);
+    float lit = 0.0;
+    for (int y = -1; y <= 1; y = y + 1) {
+        for (int x = 1; x >= -1; x = x - 1) {
+            float2 offset = float2(float(x), float(y)) * texel;
+            float stored = t_page_shadow.Sample(s_page_curl, uv + offset).r;
+            float shadowed = (ndc.z > stored + PAGE_CURL_SHADOW_BIAS) ? 0.0 : 1.0;
+            lit = lit + shadowed;
+        }
+    }
+    return lit / 9.0;
+}
+
+float4 page_curl_fragment(PageCurlVertexOutput input) : SV_Target0 {
+    // 捕获纹理整窗大小、只有页面矩形那块被写过：取 uv 往矩形内收半像素。
+    float2 uv_min = (cu_capture_origin + float2(0.5, 0.5)) / cu_window_size;
+    float2 uv_max = (cu_capture_origin + cu_page_size - float2(0.5, 0.5)) / cu_window_size;
+    float2 capture_uv = clamp(input.uv, uv_min, uv_max);
+    // 全场唯一一次正面采样。
+    float3 paper = t_page_capture.Sample(s_page_curl, capture_uv).rgb;
+
+    // past 从材质坐标逐像素现算 —— 等值线是解析直线（母本注释里的台阶案例）。
+    float2 local = input.material * cu_page_size;
+    float r = page_curl_radius_at(local);
+    float past = dot(cu_axis_normal, local) - cu_axis_d;
+    float theta = past / r;
+    float w = max(fwidth(past), 1e-4);
+
+    if (past <= -w) {
+        // 平摊那一片就是纸色，不做任何明暗处理。
+        return float4(paper, 1.0);
+    }
+
+    // 卷面法向：圆柱是 (n·sinθ, cosθ)；圆锥的法向沿切向偏 r'(s)·(cosθ−1)。
+    float cone_denom = cu_cone_a.y - cu_cone_a.x;
+    float r_prime = abs(cone_denom) > 1.0 ? cu_cone_a.z * cu_radius / cone_denom : 0.0;
+    float2 tangent = float2(-cu_axis_normal.y, cu_axis_normal.x);
+    float3 n = normalize(
+        float3(cu_axis_normal * sin(theta), cos(theta))
+        + float3(tangent, 0.0) * (r_prime * (cos(theta) - 1.0)));
+    float3 light = normalize(cu_light_dir.xyz);
+    float diffuse = max(dot(n, light), 0.0);
+    float light_z = max(light.z, 0.001);
+    float roll = clamp(past / (PAGE_CURL_PI * r), 0.0, 1.0);
+    float crest = sin(roll * PAGE_CURL_PI);
+    float3 front = paper * (1.0 + 0.10 * crest
+        + 0.05 * (diffuse / light_z - 1.0) * (1.0 - crest));
+
+    // 背面 = 纸白 + 正面的墨透过来（BLEED），采的仍是正面捕获纹理、材质不镜像。
+    float2 bleed_uv = (cu_capture_origin + input.material * cu_page_size) / cu_window_size;
+    float3 bleed = t_page_capture.Sample(s_page_curl, clamp(bleed_uv, uv_min, uv_max)).rgb;
+    float back_fade = clamp((theta - PAGE_CURL_PI) / 1.5, 0.0, 1.0);
+    float3 back = (cu_back_color.rgb + (bleed - cu_back_color.rgb) * PAGE_CURL_BLEED)
+        * mix(0.985, 1.0, min(back_fade * 6.0, 1.0));
+
+    // 正面 ↔ 背面：θ = π/2 那一点法向过零，用现算 past 做两像素过渡。
+    float turn = PAGE_CURL_PI * r * 0.5;
+    float side = clamp(0.5 + (turn - past) / (2.0 * w), 0.0, 1.0);
+    float3 curled = mix(back, front, side);
+    // 纸边光。两样都不乘 shadow map 那一道（母本同口径：投影是几何自己那趟）。
+    float3 rim = float3(0.06 * (1.0 - smoothstep(0.0, 2.0, input.edge)));
+    float3 lit = curled + rim;
+    float3 flat_color = paper;
+    return float4(mix(flat_color, lit, smoothstep(-w, w, past)), 1.0);
+}

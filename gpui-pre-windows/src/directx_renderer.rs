@@ -43,6 +43,9 @@ pub(crate) struct DirectXRenderer {
     resources: Option<DirectXResources>,
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
+    /// 仿真翻页的资源与绘制（shaders.hlsl 页面卷曲那段 + 本文件尾部）。
+    /// 与 device 一起存：设备丢失重建时靠指针比对自动换新。
+    page_curl: Option<(ID3D11Device, PageCurlResources)>,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
 
@@ -189,6 +192,7 @@ impl DirectXRenderer {
             resources: Some(resources),
             globals,
             pipelines,
+            page_curl: None,
             direct_composition,
             font_info: Self::get_font_info(),
             width: 1,
@@ -362,7 +366,7 @@ impl DirectXRenderer {
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
-        for batch in scene.batches() {
+        for batch in scene.batches_in(0..gpui::CAPTURE_ORDER_BASE) {
             let _annotation = annotation
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
@@ -385,12 +389,25 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::PageCurlMeshes(_) => {
-                    // 仿真翻页的卷曲网格目前只在 wgpu（Linux）与 Android 两条路径上有
-                    // 渲染实现；DirectX 这边还没移植 page_curl 的管线与那两趟离屏
-                    // pass（页面捕获 + 阴影）。folio 在这两个平台上不提供卷页动画
-                    // （turn_animation 那一侧门控），收到该批次时跳过即可 —— 变体是
-                    // fork 加的，这里的 match 只欠一个 exhaustive 的回答。
-                    Ok(())
+                    let devices = self.devices.as_ref().context("devices missing")?;
+                    let resources = self.resources.as_ref().context("resources missing")?;
+                    let main_rtv = resources
+                        .render_target_view
+                        .as_ref()
+                        .context("missing render target view")?;
+                    self.page_curl
+                        .as_mut()
+                        .context("page_curl missing")?
+                        .1
+                        .draw_mesh(
+                        &devices.device,
+                        &devices.device_context,
+                        main_rtv,
+                        Size::new(
+                            DevicePixels(self.width.max(1) as i32),
+                            DevicePixels(self.height.max(1) as i32),
+                        ),
+                    )
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
             }
@@ -408,6 +425,54 @@ impl DirectXRenderer {
                     scene.surfaces.len(),
                 )
             })?;
+        }
+        Ok(())
+    }
+
+    /// 把一个层段里的批次画进当前绑定的渲染目标。捕获 pass 用它（skip_curl =
+    /// true，防卷曲网格采样到自己）；主 pass 的批走留在 render() 里，命中卷曲
+    /// 批次时直接画。
+    fn draw_batches_in(
+        &mut self,
+        scene: &Scene,
+        bounds: Bounds<ScaledPixels>,
+        layer_range: std::ops::Range<gpui::DrawOrder>,
+        skip_curl: bool,
+    ) -> Result<()> {
+        // 页框 scissor 没有做：全局 rasterizer 是 ScissorEnable=false，换状态
+        // 的话两条 pass 都要跟着切 —— 层过滤与 primitive 自己的 content mask
+        // 已把范围收紧，需要时再开。
+        let _ = bounds;
+        for batch in scene.batches_in(layer_range) {
+            match batch {
+                PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
+                PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
+                PrimitiveBatch::Paths(range) => {
+                    let paths = &scene.paths[range];
+                    self.draw_paths_to_intermediate(paths)?;
+                    self.draw_paths_from_intermediate(paths)
+                }
+                PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
+                PrimitiveBatch::MonochromeSprites { texture_id, range } => {
+                    self.draw_monochrome_sprites(texture_id, range.start, range.len())
+                }
+                PrimitiveBatch::SubpixelSprites { texture_id, range } => {
+                    self.draw_subpixel_sprites(texture_id, range.start, range.len())
+                }
+                PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+                    self.draw_polychrome_sprites(texture_id, range.start, range.len())
+                }
+                PrimitiveBatch::PageCurlMeshes(_) => {
+                    // 捕获层里不该有卷曲批次（它的 order 在 CAPTURE_ORDER_BASE 之下）；
+                    // 万一出现，跳过 —— 防止捕获纹理采样到自己。
+                    if skip_curl {
+                        continue;
+                    }
+                    Ok(())
+                }
+                PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+            }
+            .with_context(|| "drawing batch in capture pass".to_string())?;
         }
         Ok(())
     }
@@ -1725,6 +1790,8 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         EmojiRasterization,
+        PageCurl,
+        PageCurlShadow,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1801,6 +1868,14 @@ pub(crate) mod shader_resources {
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
                     ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
+                },
+                ShaderModule::PageCurl => match target {
+                    ShaderTarget::Vertex => PAGE_CURL_VERTEX_BYTES,
+                    ShaderTarget::Fragment => PAGE_CURL_FRAGMENT_BYTES,
+                },
+                ShaderModule::PageCurlShadow => match target {
+                    ShaderTarget::Vertex => PAGE_CURL_SHADOW_VERTEX_BYTES,
+                    ShaderTarget::Fragment => PAGE_CURL_SHADOW_FRAGMENT_BYTES,
                 },
             };
             Self { inner: bytes }
@@ -1889,6 +1964,8 @@ pub(crate) mod shader_resources {
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
+                ShaderModule::PageCurl => "page_curl",
+                ShaderModule::PageCurlShadow => "page_curl_shadow",
             }
         }
     }
@@ -2075,4 +2152,688 @@ mod dxgi {
             number & 0xFFFF
         ))
     }
+}
+
+// ---- 页面卷曲（page curl）：D3D11 资源与绘制 ----
+//
+// 母本同 Metal 侧（gpui-pre-wgpu 的 page_curl.rs；MSL/HLSL 各自直译那份 WGSL）。
+// 与本 crate 既有惯例的差异记两条：
+//   - 网格走顶点拉取：顶点进 StructuredBuffer（VS t1），DrawIndexed 的 vertex_id
+//     就是索引值 —— 与实例渲染一样不需要 InputLayout。
+//   - 卷曲 pass 自带深度（Depth32Float + LessEqual），主渲染器本来没有深度缓冲；
+//     页框 scissor 没做（全局 rasterizer 是 ScissorEnable=false），层过滤与
+//     primitive 的 content mask 已把范围收紧。
+
+/// 与 shaders.hlsl 的 `cbuffer CurlUniforms`（b2）逐格对应：240 字节，补位格
+/// 在 HLSL 侧展开成了标量（cbuffer 里 [f32;3] 数组每元素按 16 对齐，会顶错位）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GpuCurlUniforms {
+    page_origin: [f32; 2],
+    page_size: [f32; 2],
+    window_size: [f32; 2],
+    axis_normal: [f32; 2],
+    axis_d: f32,
+    radius: f32,
+    camera_distance: f32,
+    scale_factor: f32,
+    back_color: [f32; 4],
+    light_dir: [f32; 4],
+    cone_a: [f32; 4],
+    cone_b: [f32; 4],
+    capture_origin: [f32; 2],
+    _padding: [f32; 2],
+    shadow_map_size: f32,
+    _pad0: [f32; 3],
+    _pad1: [f32; 3],
+    _pad1a: f32,
+    light_view_proj: [[f32; 4]; 4],
+    back_capture_origin: [f32; 2],
+    _pad2: [f32; 2],
+}
+
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<GpuCurlUniforms>() == 240);
+    assert!(offset_of!(GpuCurlUniforms, shadow_map_size) == 128);
+    assert!(offset_of!(GpuCurlUniforms, light_view_proj) == 160);
+    assert!(offset_of!(GpuCurlUniforms, back_capture_origin) == 224);
+};
+
+const PAGE_CURL_SHADOW_MAP_SIZE: u32 = 1024;
+
+struct PageCurlResources {
+    mesh_vs: ID3D11VertexShader,
+    mesh_ps: ID3D11PixelShader,
+    shadow_vs: ID3D11VertexShader,
+    shadow_ps: ID3D11PixelShader,
+    /// b2：卷曲 uniform（240 字节，DYNAMIC，每帧 update_buffer）。
+    uniform_buffer: ID3D11Buffer,
+    /// b3：视口（16 字节对齐格）。
+    viewport_buffer: ID3D11Buffer,
+    sampler: ID3D11SamplerState,
+    depth_state: ID3D11DepthStencilState,
+    capture: Option<PageCurlCapture>,
+    back_capture: Option<PageCurlCapture>,
+    depth: Option<(ID3D11Texture2D, ID3D11DepthStencilView, Size<DevicePixels>)>,
+    shadow: Option<PageCurlShadowMap>,
+    geometry: Option<PageCurlGeometry>,
+    frame_uniforms: Option<GpuCurlUniforms>,
+    frame: Option<PageCurlFrame>,
+}
+
+struct PageCurlCapture {
+    texture: ID3D11Texture2D,
+    rtv: ID3D11RenderTargetView,
+    srv: ID3D11ShaderResourceView,
+    size: Size<DevicePixels>,
+}
+
+struct PageCurlShadowMap {
+    color: ID3D11Texture2D,
+    color_rtv: ID3D11RenderTargetView,
+    depth: ID3D11Texture2D,
+    depth_dsv: ID3D11DepthStencilView,
+}
+
+struct PageCurlGeometry {
+    vertices: ID3D11Buffer,
+    vertices_srv: ID3D11ShaderResourceView,
+    indices: ID3D11Buffer,
+    index_count: u32,
+    page_size: [f32; 2],
+}
+
+struct PageCurlFrame {
+    index_count: u32,
+    page_bounds: Bounds<ScaledPixels>,
+}
+
+impl PageCurlResources {
+    pub(crate) fn new(device: &ID3D11Device) -> Result<Self> {
+        let mesh_vs = create_vertex_shader(
+            device,
+            RawShaderBytes::new(ShaderModule::PageCurl, ShaderTarget::Vertex)?.as_bytes(),
+        )?;
+        let mesh_ps = create_fragment_shader(
+            device,
+            RawShaderBytes::new(ShaderModule::PageCurl, ShaderTarget::Fragment)?.as_bytes(),
+        )?;
+        let shadow_vs = create_vertex_shader(
+            device,
+            RawShaderBytes::new(ShaderModule::PageCurlShadow, ShaderTarget::Vertex)?.as_bytes(),
+        )?;
+        let shadow_ps = create_fragment_shader(
+            device,
+            RawShaderBytes::new(ShaderModule::PageCurlShadow, ShaderTarget::Fragment)?.as_bytes(),
+        )?;
+        let uniform_buffer = create_constant_buffer::<GpuCurlUniforms>(device)?;
+        let viewport_buffer = create_constant_buffer::<[f32; 4]>(device)?;
+
+        let sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            output
+        };
+
+        // 深度：开测试、全写、LessEqual —— 卷起来的纸与自己的前后关系靠它。
+        let depth_state = unsafe {
+            let desc = D3D11_DEPTH_STENCIL_DESC {
+                DepthEnable: true.into(),
+                DepthWriteMask: D3D11_DEPTH_WRITE_MASK_ALL,
+                DepthFunc: D3D11_COMPARISON_LESS_EQUAL,
+                StencilEnable: false.into(),
+                ..Default::default()
+            };
+            let mut output = None;
+            device.CreateDepthStencilState(&desc, Some(&mut output))?;
+            output
+        };
+
+        Ok(Self {
+            mesh_vs,
+            mesh_ps,
+            shadow_vs,
+            shadow_ps,
+            uniform_buffer: uniform_buffer.unwrap(),
+            viewport_buffer: viewport_buffer.unwrap(),
+            sampler: sampler.unwrap(),
+            depth_state: depth_state.unwrap(),
+            capture: None,
+            back_capture: None,
+            depth: None,
+            shadow: None,
+            geometry: None,
+            frame_uniforms: None,
+            frame: None,
+        })
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.capture = None;
+        self.back_capture = None;
+        self.depth = None;
+        self.shadow = None;
+        self.geometry = None;
+        self.frame = None;
+        self.frame_uniforms = None;
+    }
+
+    /// 从场景里取第一张网格，上传顶点/索引/uniform。几何按 (page_size, 索引数)
+    /// 缓存：翻页进度只改 uniform，网格本身不变。
+    pub(crate) fn prepare(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        scene: &Scene,
+    ) -> Result<()> {
+        let Some(mesh) = scene.page_curl_meshes.first() else {
+            self.frame = None;
+            return Ok(());
+        };
+        let cache_hit = self
+            .geometry
+            .as_ref()
+            .is_some_and(|geometry| geometry.page_size == mesh.uniforms.page_size);
+        if !cache_hit {
+            // IMMUTABLE + 创建时给数据：动画期间网格不变，换页框才重建。
+            let vertex_data = unsafe {
+                std::slice::from_raw_parts(
+                    mesh.vertices.as_ptr() as *const u8,
+                    std::mem::size_of_val(mesh.vertices.as_ref()),
+                )
+            };
+            let vertices = {
+                let desc = D3D11_BUFFER_DESC {
+                    ByteWidth: vertex_data.len() as u32,
+                    Usage: D3D11_USAGE_IMMUTABLE,
+                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                    CPUAccessFlags: 0,
+                    MiscFlags: D3D11_RESOURCE_MISC_BUFFER_STRUCTURED.0 as u32,
+                    StructureByteStride: std::mem::size_of::<PageCurlVertex>() as u32,
+                };
+                let initial = D3D11_SUBRESOURCE_DATA {
+                    pSysMem: vertex_data.as_ptr() as _,
+                    SysMemPitch: 0,
+                    SysMemSlicePitch: 0,
+                };
+                let mut buffer = None;
+                unsafe { device.CreateBuffer(&desc, Some(&initial), Some(&mut buffer)) }?;
+                buffer.unwrap()
+            };
+            let mut srv = None;
+            unsafe {
+                device.CreateShaderResourceView(
+                    &vertices,
+                    Some(&D3D11_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_UNKNOWN,
+                        ViewDimension: D3D11_SRV_DIMENSION_BUFFER,
+                        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Buffer: D3D11_BUFFER_SRV {
+                                Anonymous1: D3D11_BUFFER_SRV_0 { FirstElement: 0 },
+                                Anonymous2: D3D11_BUFFER_SRV_1 {
+                                    NumElements: mesh.vertices.len() as u32,
+                                },
+                            },
+                        },
+                    }),
+                    Some(&mut srv),
+                )?;
+            }
+
+            let index_data = unsafe {
+                std::slice::from_raw_parts(
+                    mesh.indices.as_ptr() as *const u8,
+                    std::mem::size_of_val(mesh.indices.as_ref()),
+                )
+            };
+            let indices = {
+                let desc = D3D11_BUFFER_DESC {
+                    ByteWidth: index_data.len() as u32,
+                    Usage: D3D11_USAGE_IMMUTABLE,
+                    BindFlags: D3D11_BIND_INDEX_BUFFER.0 as u32,
+                    CPUAccessFlags: 0,
+                    MiscFlags: 0,
+                    StructureByteStride: 0,
+                };
+                let initial = D3D11_SUBRESOURCE_DATA {
+                    pSysMem: index_data.as_ptr() as _,
+                    SysMemPitch: 0,
+                    SysMemSlicePitch: 0,
+                };
+                let mut buffer = None;
+                unsafe { device.CreateBuffer(&desc, Some(&initial), Some(&mut buffer)) }?;
+                buffer.unwrap()
+            };
+
+            self.geometry = Some(PageCurlGeometry {
+                vertices,
+                vertices_srv: srv.unwrap(),
+                indices,
+                index_count: mesh.indices.len() as u32,
+                page_size: mesh.uniforms.page_size,
+            });
+        }
+
+        let light_view_proj = page_curl_light_view_proj(&mesh.uniforms);
+        self.frame_uniforms = Some(GpuCurlUniforms::from_parts(&mesh.uniforms, light_view_proj));
+        self.frame = Some(PageCurlFrame {
+            index_count: mesh.indices.len() as u32,
+            page_bounds: mesh.bounds,
+        });
+        let _ = device_context;
+        Ok(())
+    }
+
+    fn ensure_shadow(&mut self, device: &ID3D11Device) -> Result<()> {
+        if self.shadow.is_some() {
+            return Ok(());
+        }
+        let (color, color_rtv) = page_curl_texture(
+            device,
+            PAGE_CURL_SHADOW_MAP_SIZE,
+            PAGE_CURL_SHADOW_MAP_SIZE,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+        )?;
+        let color_rtv = color_rtv.unwrap();
+        let (depth, depth_dsv) = page_curl_depth(
+            device,
+            PAGE_CURL_SHADOW_MAP_SIZE,
+            PAGE_CURL_SHADOW_MAP_SIZE,
+        )?;
+        self.shadow = Some(PageCurlShadowMap {
+            color,
+            color_rtv,
+            depth,
+            depth_dsv,
+        });
+        Ok(())
+    }
+
+    fn ensure_depth(
+        &mut self,
+        device: &ID3D11Device,
+        size: Size<DevicePixels>,
+    ) -> Result<()> {
+        if self
+            .depth
+            .as_ref()
+            .is_some_and(|(_, _, existing)| *existing == size)
+        {
+            return Ok(());
+        }
+        let (texture, _) = page_curl_texture(
+            device,
+            size.width.0.max(1) as u32,
+            size.height.0.max(1) as u32,
+            DXGI_FORMAT_D32_FLOAT,
+        )?;
+        let mut dsv = None;
+        unsafe { device.CreateDepthStencilView(&texture, None, Some(&mut dsv))? };
+        self.depth = Some((texture, dsv.unwrap(), size));
+        Ok(())
+    }
+
+    /// 正面/背面捕获纹理（整窗大小、格式与主目标一致），绑定为渲染目标并清成纸色。
+    pub(crate) fn bind_capture(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        back: bool,
+        size: Size<DevicePixels>,
+        clear_color: [f32; 4],
+    ) -> Result<()> {
+        let slot = if back { &mut self.back_capture } else { &mut self.capture };
+        let needs_new = slot
+            .as_ref()
+            .map(|capture| capture.size != size)
+            .unwrap_or(true);
+        if needs_new {
+            let (texture, rtv) = page_curl_texture(
+                device,
+                size.width.0.max(1) as u32,
+                size.height.0.max(1) as u32,
+                RENDER_TARGET_FORMAT,
+            )?;
+            let srv = page_curl_srv(&texture)?;
+            *slot = Some(PageCurlCapture {
+                texture,
+                rtv: rtv.unwrap(),
+                srv: srv.unwrap(),
+                size,
+            });
+        }
+        let capture = slot.as_ref().unwrap();
+
+        unsafe {
+            device_context
+                .OMSetRenderTargets(Some(&[Some(capture.rtv.clone())][..]), None);
+            device_context
+                .ClearRenderTargetView(&capture.rtv, &clear_color);
+            device_context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: size.width.0 as f32,
+                Height: size.height.0 as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]));
+        }
+        Ok(())
+    }
+
+    /// 把网格从光源方向渲染进 shadow map。必须在捕获与主 pass 之前调用。
+    pub(crate) fn encode_shadow(&mut self, device_context: &ID3D11DeviceContext) -> Result<()> {
+        let (Some(_frame), Some(geometry), Some(shadow), Some(uniforms)) = (
+            self.frame.as_ref(),
+            self.geometry.as_ref(),
+            self.shadow.as_ref(),
+            self.frame_uniforms,
+        ) else {
+            return Ok(());
+        };
+        update_buffer(device_context, &self.uniform_buffer, &[uniforms])?;
+        unsafe {
+            device_context.OMSetRenderTargets(
+                Some(&[Some(shadow.color_rtv.clone())][..]),
+                Some(&shadow.depth_dsv),
+            );
+            device_context.ClearRenderTargetView(&shadow.color_rtv, &[1.0; 4]);
+            device_context.ClearDepthStencilView(
+                &shadow.depth_dsv,
+                D3D11_CLEAR_DEPTH.0,
+                1.0,
+                0,
+            );
+            device_context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: PAGE_CURL_SHADOW_MAP_SIZE as f32,
+                Height: PAGE_CURL_SHADOW_MAP_SIZE as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]));
+            device_context
+                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            device_context.IASetInputLayout(None);
+            device_context.IASetIndexBuffer(
+                &geometry.indices,
+                DXGI_FORMAT_R32_UINT,
+                0,
+            );
+            device_context.VSSetShader(&self.shadow_vs, None);
+            device_context.PSSetShader(&self.shadow_ps, None);
+            device_context
+                .VSSetShaderResources(1, Some(&[Some(geometry.vertices_srv.clone())][..]));
+            device_context
+                .VSSetConstantBuffers(2, Some(&[Some(self.uniform_buffer.clone())][..]));
+            device_context
+                .DrawIndexed(geometry.index_count as u32, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// 画卷曲网格进主颜色附件。捕获 pass 换过 OM 绑定，这里接回主 RTV 并挂上
+    /// 自己的深度；画完把深度解绑恢复成主 pass 其余批次的无深度状态。
+    pub(crate) fn draw_mesh(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        main_rtv: &ID3D11RenderTargetView,
+        size: Size<DevicePixels>,
+    ) -> Result<()> {
+        let (Some(frame), Some(geometry), Some((_, depth_dsv, _))) = (
+            self.frame.as_ref(),
+            self.geometry.as_ref(),
+            self.depth.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        let Some(capture) = self.capture.as_ref() else {
+            // 没有捕获纹理就不画：母本注释里那条「绑黑纹理 = 屏上一条黑带」。
+            return Ok(());
+        };
+        let Some(back_capture) = self.back_capture.as_ref() else {
+            return Ok(());
+        };
+        let Some(uniforms) = self.frame_uniforms else {
+            return Ok(());
+        };
+        update_buffer(device_context, &self.uniform_buffer, &[uniforms])?;
+        update_buffer(
+            device_context,
+            &self.viewport_buffer,
+            &[[size.width.0 as f32, size.height.0 as f32, 0.0, 0.0]],
+        )?;
+        let _ = device;
+        unsafe {
+            // 主颜色附件 load 语义继续（不 clear），深度换上自己的这一份。
+            device_context.OMSetRenderTargets(
+                Some(&[Some(main_rtv.clone())][..]),
+                Some(depth_dsv),
+            );
+            device_context.OMSetDepthStencilState(&self.depth_state, 0);
+            device_context
+                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            device_context.IASetInputLayout(None);
+            device_context.IASetIndexBuffer(&geometry.indices, DXGI_FORMAT_R32_UINT, 0);
+            device_context.VSSetShader(&self.mesh_vs, None);
+            device_context.PSSetShader(&self.mesh_ps, None);
+            device_context
+                .VSSetShaderResources(1, Some(&[Some(geometry.vertices_srv.clone())][..]));
+            device_context
+                .VSSetConstantBuffers(2, Some(&[Some(self.uniform_buffer.clone())][..]));
+            device_context
+                .VSSetConstantBuffers(3, Some(&[Some(self.viewport_buffer.clone())][..]));
+            device_context
+                .PSSetConstantBuffers(2, Some(&[Some(self.uniform_buffer.clone())][..]));
+            device_context
+                .PSSetShaderResources(2, Some(&[Some(capture.srv.clone())][..]));
+            device_context
+                .PSSetShaderResources(4, Some(&[Some(back_capture.srv.clone())][..]));
+            device_context
+                .PSSetSamplers(1, Some(&[Some(self.sampler.clone())][..]));
+            device_context
+                .DrawIndexed(frame.index_count as u32, 0, 0);
+            // 深度解绑恢复：主 pass 其余批次没有深度语义。
+            device_context
+                .OMSetRenderTargets(Some(&[Some(main_rtv.clone())][..]), None);
+            device_context.OMSetDepthStencilState(None, 0);
+        }
+        Ok(())
+    }
+}
+
+impl GpuCurlUniforms {
+    fn from_parts(uniforms: &PageCurlUniforms, light_view_proj: [[f32; 4]; 4]) -> Self {
+        Self {
+            page_origin: uniforms.page_origin,
+            page_size: uniforms.page_size,
+            window_size: uniforms.window_size,
+            axis_normal: uniforms.axis_normal,
+            axis_d: uniforms.axis_d,
+            radius: uniforms.radius,
+            camera_distance: uniforms.camera_distance,
+            scale_factor: uniforms.scale_factor,
+            back_color: uniforms.back_color,
+            light_dir: uniforms.light_dir,
+            cone_a: uniforms.cone_a,
+            cone_b: uniforms.cone_b,
+            capture_origin: uniforms.capture_origin,
+            _padding: [0.0; 2],
+            shadow_map_size: PAGE_CURL_SHADOW_MAP_SIZE as f32,
+            _pad0: [0.0; 3],
+            _pad1: [0.0; 3],
+            _pad1a: 0.0,
+            light_view_proj,
+            back_capture_origin: uniforms.back_capture_origin,
+            _pad2: [0.0; 2],
+        }
+    }
+}
+
+/// 离屏纹理 + RTV。捕获用主目标同格式，shadow map 用 RGBA8，深度用 D32。
+fn page_curl_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+) -> Result<(ID3D11Texture2D, Option<ID3D11RenderTargetView>)> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut texture = None;
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+    let texture = texture.unwrap();
+    let mut rtv = None;
+    unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut rtv))? };
+    Ok((texture, rtv))
+}
+
+fn page_curl_depth(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<(ID3D11Texture2D, ID3D11DepthStencilView)> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_D32_FLOAT,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_DEPTH_STENCIL.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut texture = None;
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+    let texture = texture.unwrap();
+    let mut dsv = None;
+    unsafe { device.CreateDepthStencilView(&texture, None, Some(&mut dsv))? };
+    Ok((texture, dsv.unwrap()))
+}
+
+fn page_curl_srv(texture: &ID3D11Texture2D) -> Result<Option<ID3D11ShaderResourceView>> {
+    let mut srv = None;
+    unsafe {
+        let device = texture.GetDevice()?;
+        let resource: ID3D11Resource = texture.cast()?;
+        device.CreateShaderResourceView(&resource, None, Some(&mut srv))?;
+    }
+    Ok(srv)
+}
+
+fn page_curl_light_view_proj(uniforms: &PageCurlUniforms) -> [[f32; 4]; 4] {
+    fn normalize(v: [f32; 3]) -> [f32; 3] {
+        let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
+        [v[0] / length, v[1] / length, v[2] / length]
+    }
+    fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    }
+    fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+    type Mat4 = [[f32; 4]; 4];
+    fn mul(a: Mat4, b: Mat4) -> Mat4 {
+        let mut out = [[0.0f32; 4]; 4];
+        for column in 0..4 {
+            for row in 0..4 {
+                out[column][row] = (0..4).map(|k| a[k][row] * b[column][k]).sum();
+            }
+        }
+        out
+    }
+    fn ortho(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> Mat4 {
+        [
+            [2.0 / (right - left), 0.0, 0.0, 0.0],
+            [0.0, 2.0 / (top - bottom), 0.0, 0.0],
+            [0.0, 0.0, 1.0 / (far - near), 0.0],
+            [
+                -(right + left) / (right - left),
+                -(top + bottom) / (top - bottom),
+                -near / (far - near),
+                1.0,
+            ],
+        ]
+    }
+    fn look_at(eye: [f32; 3], center: [f32; 3], up: [f32; 3]) -> Mat4 {
+        let forward = normalize([center[0] - eye[0], center[1] - eye[1], center[2] - eye[2]]);
+        let right = normalize(cross(forward, up));
+        let up = cross(right, forward);
+        [
+            [right[0], up[0], -forward[0], 0.0],
+            [right[1], up[1], -forward[1], 0.0],
+            [right[2], up[2], -forward[2], 0.0],
+            [-dot(right, eye), -dot(up, eye), dot(forward, eye), 1.0],
+        ]
+    }
+    let direction = normalize([
+        uniforms.light_dir[0],
+        uniforms.light_dir[1],
+        uniforms.light_dir[2],
+    ]);
+    let center = [
+        uniforms.page_origin[0] + uniforms.page_size[0] * 0.5,
+        uniforms.page_origin[1] + uniforms.page_size[1] * 0.5,
+        0.0,
+    ];
+    let diagonal = (uniforms.page_size[0] * uniforms.page_size[0]
+        + uniforms.page_size[1] * uniforms.page_size[1])
+        .sqrt()
+        .max(1.0);
+    let distance = diagonal * 2.0;
+    let eye = [
+        center[0] + direction[0] * distance,
+        center[1] + direction[1] * distance,
+        center[2] + direction[2] * distance,
+    ];
+    let up = if direction[1].abs() > 0.95 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let extent = diagonal * 0.65 + uniforms.radius * 2.5 + 8.0;
+    let projection = ortho(
+        -extent,
+        extent,
+        -extent,
+        extent,
+        -0.1,
+        -(distance * 2.0 + uniforms.radius * 4.0),
+    );
+    mul(projection, look_at(eye, center, up))
 }
