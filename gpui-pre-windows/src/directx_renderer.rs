@@ -409,6 +409,12 @@ impl DirectXRenderer {
                         ),
                     )
                 }
+                PrimitiveBatch::BackdropGlasses(_) => {
+                    // 背景模糊只有 wgpu 那条渲染路径实现（Android 与 Linux 桌面）。这一端
+                    // 跳过玻璃：屏上只剩压在它上面的那层半透明 tint，与加这个 primitive
+                    // 之前逐像素相同。
+                    Ok(())
+                }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
             }
             .with_context(|| {
@@ -468,6 +474,12 @@ impl DirectXRenderer {
                     if skip_curl {
                         continue;
                     }
+                    Ok(())
+                }
+                PrimitiveBatch::BackdropGlasses(_) => {
+                    // 背景模糊只有 wgpu 那条渲染路径实现（Android 与 Linux 桌面）。这一端
+                    // 跳过玻璃：屏上只剩压在它上面的那层半透明 tint，与加这个 primitive
+                    // 之前逐像素相同。
                     Ok(())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
@@ -2448,11 +2460,8 @@ impl PageCurlResources {
             DXGI_FORMAT_R8G8B8A8_UNORM,
         )?;
         let color_rtv = color_rtv.unwrap();
-        let (depth, depth_dsv) = page_curl_depth(
-            device,
-            PAGE_CURL_SHADOW_MAP_SIZE,
-            PAGE_CURL_SHADOW_MAP_SIZE,
-        )?;
+        let (depth, depth_dsv) =
+            page_curl_depth(device, PAGE_CURL_SHADOW_MAP_SIZE, PAGE_CURL_SHADOW_MAP_SIZE)?;
         self.shadow = Some(PageCurlShadowMap {
             color,
             color_rtv,
@@ -2462,11 +2471,7 @@ impl PageCurlResources {
         Ok(())
     }
 
-    fn ensure_depth(
-        &mut self,
-        device: &ID3D11Device,
-        size: Size<DevicePixels>,
-    ) -> Result<()> {
+    fn ensure_depth(&mut self, device: &ID3D11Device, size: Size<DevicePixels>) -> Result<()> {
         if self
             .depth
             .as_ref()
@@ -2495,7 +2500,11 @@ impl PageCurlResources {
         size: Size<DevicePixels>,
         clear_color: [f32; 4],
     ) -> Result<()> {
-        let slot = if back { &mut self.back_capture } else { &mut self.capture };
+        let slot = if back {
+            &mut self.back_capture
+        } else {
+            &mut self.capture
+        };
         let needs_new = slot
             .as_ref()
             .map(|capture| capture.size != size)
@@ -2518,10 +2527,8 @@ impl PageCurlResources {
         let capture = slot.as_ref().unwrap();
 
         unsafe {
-            device_context
-                .OMSetRenderTargets(Some(&[Some(capture.rtv.clone())][..]), None);
-            device_context
-                .ClearRenderTargetView(&capture.rtv, &clear_color);
+            device_context.OMSetRenderTargets(Some(&[Some(capture.rtv.clone())][..]), None);
+            device_context.ClearRenderTargetView(&capture.rtv, &clear_color);
             device_context.RSSetViewports(Some(&[D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
@@ -2551,12 +2558,7 @@ impl PageCurlResources {
                 Some(&shadow.depth_dsv),
             );
             device_context.ClearRenderTargetView(&shadow.color_rtv, &[1.0; 4]);
-            device_context.ClearDepthStencilView(
-                &shadow.depth_dsv,
-                D3D11_CLEAR_DEPTH.0,
-                1.0,
-                0,
-            );
+            device_context.ClearDepthStencilView(&shadow.depth_dsv, D3D11_CLEAR_DEPTH.0, 1.0, 0);
             device_context.RSSetViewports(Some(&[D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
@@ -2565,22 +2567,15 @@ impl PageCurlResources {
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             }]));
-            device_context
-                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            device_context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             device_context.IASetInputLayout(None);
-            device_context.IASetIndexBuffer(
-                &geometry.indices,
-                DXGI_FORMAT_R32_UINT,
-                0,
-            );
+            device_context.IASetIndexBuffer(&geometry.indices, DXGI_FORMAT_R32_UINT, 0);
             device_context.VSSetShader(&self.shadow_vs, None);
             device_context.PSSetShader(&self.shadow_ps, None);
             device_context
                 .VSSetShaderResources(1, Some(&[Some(geometry.vertices_srv.clone())][..]));
-            device_context
-                .VSSetConstantBuffers(2, Some(&[Some(self.uniform_buffer.clone())][..]));
-            device_context
-                .DrawIndexed(geometry.index_count as u32, 0, 0);
+            device_context.VSSetConstantBuffers(2, Some(&[Some(self.uniform_buffer.clone())][..]));
+            device_context.DrawIndexed(geometry.index_count as u32, 0, 0);
         }
         Ok(())
     }
@@ -2620,36 +2615,24 @@ impl PageCurlResources {
         let _ = device;
         unsafe {
             // 主颜色附件 load 语义继续（不 clear），深度换上自己的这一份。
-            device_context.OMSetRenderTargets(
-                Some(&[Some(main_rtv.clone())][..]),
-                Some(depth_dsv),
-            );
+            device_context.OMSetRenderTargets(Some(&[Some(main_rtv.clone())][..]), Some(depth_dsv));
             device_context.OMSetDepthStencilState(&self.depth_state, 0);
-            device_context
-                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            device_context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             device_context.IASetInputLayout(None);
             device_context.IASetIndexBuffer(&geometry.indices, DXGI_FORMAT_R32_UINT, 0);
             device_context.VSSetShader(&self.mesh_vs, None);
             device_context.PSSetShader(&self.mesh_ps, None);
             device_context
                 .VSSetShaderResources(1, Some(&[Some(geometry.vertices_srv.clone())][..]));
-            device_context
-                .VSSetConstantBuffers(2, Some(&[Some(self.uniform_buffer.clone())][..]));
-            device_context
-                .VSSetConstantBuffers(3, Some(&[Some(self.viewport_buffer.clone())][..]));
-            device_context
-                .PSSetConstantBuffers(2, Some(&[Some(self.uniform_buffer.clone())][..]));
-            device_context
-                .PSSetShaderResources(2, Some(&[Some(capture.srv.clone())][..]));
-            device_context
-                .PSSetShaderResources(4, Some(&[Some(back_capture.srv.clone())][..]));
-            device_context
-                .PSSetSamplers(1, Some(&[Some(self.sampler.clone())][..]));
-            device_context
-                .DrawIndexed(frame.index_count as u32, 0, 0);
+            device_context.VSSetConstantBuffers(2, Some(&[Some(self.uniform_buffer.clone())][..]));
+            device_context.VSSetConstantBuffers(3, Some(&[Some(self.viewport_buffer.clone())][..]));
+            device_context.PSSetConstantBuffers(2, Some(&[Some(self.uniform_buffer.clone())][..]));
+            device_context.PSSetShaderResources(2, Some(&[Some(capture.srv.clone())][..]));
+            device_context.PSSetShaderResources(4, Some(&[Some(back_capture.srv.clone())][..]));
+            device_context.PSSetSamplers(1, Some(&[Some(self.sampler.clone())][..]));
+            device_context.DrawIndexed(frame.index_count as u32, 0, 0);
             // 深度解绑恢复：主 pass 其余批次没有深度语义。
-            device_context
-                .OMSetRenderTargets(Some(&[Some(main_rtv.clone())][..]), None);
+            device_context.OMSetRenderTargets(Some(&[Some(main_rtv.clone())][..]), None);
             device_context.OMSetDepthStencilState(None, 0);
         }
         Ok(())

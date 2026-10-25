@@ -65,6 +65,9 @@ pub struct Scene {
     /// 页面卷曲网格。与上面的 primitive 同一套 `order`，由 `BatchIterator`
     /// 按绘制顺序切出来。
     pub page_curl_meshes: Vec<crate::PageCurlMeshPrimitive>,
+    /// 背景模糊的玻璃面。与上面的 primitive 同一套 `order`，由 `BatchIterator` 按绘制
+    /// 顺序切出来；渲染器轮到它时把底下已经画好的那一块拷出来模糊掉再采样。
+    pub backdrop_glasses: Vec<crate::BackdropGlassPrimitive>,
     /// 这一帧要请求渲染器把页面区域烘成纹理。`None` = 不捕获。
     ///
     /// 捕获发生在主 pass 之前，用同一棵场景重画到离屏纹理；请求只应由
@@ -97,6 +100,7 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.page_curl_meshes.clear();
+        self.backdrop_glasses.clear();
         self.page_capture = None;
         self.page_capture_clear_color = None;
         self.page_capture_back = None;
@@ -180,6 +184,10 @@ impl Scene {
                 mesh.order = order;
                 self.page_curl_meshes.push(mesh.clone());
             }
+            Primitive::BackdropGlass(glass) => {
+                glass.order = order;
+                self.backdrop_glasses.push(*glass);
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -222,6 +230,7 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
         self.page_curl_meshes.sort_by_key(|mesh| mesh.order);
+        self.backdrop_glasses.sort_by_key(|glass| glass.order);
     }
 
     #[cfg_attr(
@@ -258,6 +267,8 @@ impl Scene {
             surfaces_iter: self.surfaces.iter().peekable(),
             page_curl_meshes_start: 0,
             page_curl_meshes_iter: self.page_curl_meshes.iter().peekable(),
+            backdrop_glasses_start: 0,
+            backdrop_glasses_iter: self.backdrop_glasses.iter().peekable(),
         }
     }
 }
@@ -272,6 +283,10 @@ impl Scene {
 )]
 pub(crate) enum PrimitiveKind {
     Shadow,
+    /// 玻璃必须排在 `Quad` **之前**：同一格里 tint quad 与玻璃是同一个 `order`（同一次
+    /// `Style::paint` 插进场景的），而平局按这一列枚举的序号判。排在后面就是 tint 先上屏、
+    /// 玻璃再把它连同底下的内容一起糊掉盖上去。
+    BackdropGlass,
     #[default]
     Quad,
     Path,
@@ -302,6 +317,7 @@ pub enum Primitive {
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
     PageCurlMesh(crate::PageCurlMeshPrimitive),
+    BackdropGlass(crate::BackdropGlassPrimitive),
 }
 
 #[expect(missing_docs)]
@@ -317,6 +333,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
             Primitive::PageCurlMesh(mesh) => &mesh.bounds,
+            Primitive::BackdropGlass(glass) => &glass.bounds,
         }
     }
 
@@ -331,6 +348,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::PageCurlMesh(mesh) => &mesh.content_mask,
+            Primitive::BackdropGlass(glass) => &glass.content_mask,
         }
     }
 }
@@ -362,6 +380,8 @@ struct BatchIterator<'a> {
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
     page_curl_meshes_start: usize,
     page_curl_meshes_iter: Peekable<slice::Iter<'a, crate::PageCurlMeshPrimitive>>,
+    backdrop_glasses_start: usize,
+    backdrop_glasses_iter: Peekable<slice::Iter<'a, crate::BackdropGlassPrimitive>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -446,6 +466,14 @@ impl<'a> Iterator for BatchIterator<'a> {
             self.page_curl_meshes_iter.next();
             self.page_curl_meshes_start += 1;
         }
+        while self
+            .backdrop_glasses_iter
+            .peek()
+            .is_some_and(|item| !self.range.contains(&item.order))
+        {
+            self.backdrop_glasses_iter.next();
+            self.backdrop_glasses_start += 1;
+        }
         let mut orders_and_kinds = [
             (
                 self.shadows_iter.peek().map(|s| s.order),
@@ -476,6 +504,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.page_curl_meshes_iter.peek().map(|s| s.order),
                 PrimitiveKind::PageCurlMesh,
+            ),
+            (
+                self.backdrop_glasses_iter.peek().map(|s| s.order),
+                PrimitiveKind::BackdropGlass,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -636,6 +668,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.page_curl_meshes_start = meshes_end;
                 Some(PrimitiveBatch::PageCurlMeshes(meshes_start..meshes_end))
             }
+            PrimitiveKind::BackdropGlass => {
+                let glasses_start = self.backdrop_glasses_start;
+                let mut glasses_end = glasses_start + 1;
+                self.backdrop_glasses_iter.next();
+                while self
+                    .backdrop_glasses_iter
+                    .next_if(|glass| (glass.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    glasses_end += 1;
+                }
+                self.backdrop_glasses_start = glasses_end;
+                Some(PrimitiveBatch::BackdropGlasses(glasses_start..glasses_end))
+            }
         }
     }
 }
@@ -668,6 +714,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     PageCurlMeshes(Range<usize>),
+    BackdropGlasses(Range<usize>),
     Surfaces(Range<usize>),
 }
 
@@ -701,6 +748,7 @@ impl PrimitiveBatch {
                 )
             }
             Self::PageCurlMeshes(range) => format!("page curl meshes ({})", range.len()),
+            Self::BackdropGlasses(range) => format!("backdrop glasses ({})", range.len()),
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
         }
     }

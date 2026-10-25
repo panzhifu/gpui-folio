@@ -44,6 +44,7 @@ const SUBPIXEL_SHADERS: &str = concat!(
     include_str!("shaders_subpixel.wgsl"),
 );
 
+mod backdrop;
 mod page_curl;
 
 fn least_common_multiple(left: u64, right: u64) -> u64 {
@@ -198,6 +199,7 @@ struct WgpuResources {
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
     page_curl: page_curl::PageCurlResources,
+    backdrop: backdrop::BackdropResources,
 }
 
 struct CachedTextureBindGroup {
@@ -212,6 +214,7 @@ impl WgpuResources {
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
         self.page_curl.invalidate_size_dependent();
+        self.backdrop.invalidate_size_dependent();
     }
 }
 
@@ -1088,6 +1091,9 @@ impl WgpuRenderer {
             core.dual_source_blending,
             core.uses_webgl_instance_data,
         );
+        resources
+            .backdrop
+            .set_alpha_mode(&resources.device, format, new_alpha_mode);
 
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
@@ -1350,6 +1356,7 @@ impl WgpuRendererCore {
             page_curl_pipelines,
             target_format,
         );
+        let backdrop = backdrop::BackdropResources::new(&device, target_format, alpha_mode);
 
         Self {
             resources: WgpuResources {
@@ -1368,6 +1375,7 @@ impl WgpuRendererCore {
                 path_msaa_texture: None,
                 path_msaa_view: None,
                 page_curl,
+                backdrop,
             },
             atlas,
             path_globals_offset,
@@ -1483,7 +1491,7 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
-        self.record_frame(scene, target_view, size, clear_color)
+        self.record_frame(scene, target_view, size, premultiplied_alpha, clear_color)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
                 self.resources.queue.submit(std::iter::empty());
@@ -1495,6 +1503,7 @@ impl WgpuRendererCore {
         scene: &Scene,
         frame_view: &wgpu::TextureView,
         size: Size<DevicePixels>,
+        premultiplied_alpha: bool,
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
         let mut instance_offset = 0;
@@ -1567,6 +1576,8 @@ impl WgpuRendererCore {
                 gpui::capture_order_range(1),
                 &instance_bindings,
                 &mut instance_offset,
+                false,
+                false,
             )?;
         }
 
@@ -1604,13 +1615,25 @@ impl WgpuRendererCore {
                 gpui::capture_order_range(2),
                 &instance_bindings,
                 &mut instance_offset,
+                false,
+                false,
             )?;
         }
 
+        // 有玻璃就得先把整帧画进自有的中间纹理：表面的纹理既采不到也拷不出（原因写在
+        // `backdrop` 模块头），画完再整张贴回表面。场景里没有玻璃时这条路径一步都不走，
+        // 桌面端因此一个字节都不多花。
+        let mut scene_view: Option<wgpu::TextureView> = None;
+        if !scene.backdrop_glasses.is_empty() {
+            let resources = &mut self.resources;
+            let device = &resources.device;
+            scene_view = Some(resources.backdrop.ensure_scene_target(device, size));
+        }
+        let main_view = scene_view.as_ref().unwrap_or(frame_view);
         self.encode_scene(
             scene,
             &mut encoder,
-            frame_view,
+            main_view,
             size,
             clear_color,
             None,
@@ -1618,7 +1641,16 @@ impl WgpuRendererCore {
             0..gpui::CAPTURE_ORDER_BASE,
             &instance_bindings,
             &mut instance_offset,
+            true,
+            premultiplied_alpha,
         )?;
+        if scene_view.is_some() {
+            let resources = &self.resources;
+            let device = &resources.device;
+            resources
+                .backdrop
+                .encode_present(device, &mut encoder, frame_view);
+        }
 
         let submission = self
             .resources()
@@ -1640,6 +1672,8 @@ impl WgpuRendererCore {
         layer_range: std::ops::Range<gpui::DrawOrder>,
         instance_bindings: &InstanceBindings,
         instance_offset: &mut u64,
+        main_pass: bool,
+        premultiplied_alpha: bool,
     ) -> Result<()> {
         let mut pass = begin_color_pass(
             encoder,
@@ -1732,6 +1766,30 @@ impl WgpuRendererCore {
                         );
                     }
                     pass = begin_color_pass(encoder, frame_view, wgpu::LoadOp::Load, scissor);
+                }
+                PrimitiveBatch::BackdropGlasses(range) => {
+                    // 玻璃只在主 pass 里有意义：捕获 pass 画进的是自己的纹理，那里没有
+                    // 「底下的内容」可糊。
+                    if !main_pass || range.is_empty() {
+                        continue;
+                    }
+
+                    drop(pass);
+                    let glasses = &scene.backdrop_glasses[range];
+                    {
+                        let resources = &mut self.resources;
+                        resources.backdrop.encode(
+                            &resources.device,
+                            &resources.queue,
+                            encoder,
+                            size,
+                            glasses,
+                            premultiplied_alpha,
+                        );
+                    }
+                    pass = begin_color_pass(encoder, frame_view, wgpu::LoadOp::Load, scissor);
+                    let resources = &self.resources;
+                    resources.backdrop.draw_glass(&mut pass);
                 }
                 // Surfaces are macOS-only for video playback and are not
                 // implemented by the WGPU renderer.

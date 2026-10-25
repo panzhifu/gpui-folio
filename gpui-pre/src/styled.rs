@@ -2,7 +2,7 @@ use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
-    SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
+    Pixels, SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
     TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
 };
 pub use gpui_macros::{
@@ -493,6 +493,19 @@ pub trait Styled: Sized {
         Self: Sized,
     {
         self.style().background = Some(fill.into());
+        self
+    }
+
+    /// 把这一格的底做成**真背景模糊**（毛玻璃），`radius` 是模糊半径、逻辑像素。
+    ///
+    /// 与 [`Styled::bg`] 叠着用：玻璃画在底下，`.bg()` 那层颜色作为 tint 压在玻璃上，
+    /// 于是「透多少」与「糊多少」是两个独立的数。只给 `.backdrop_blur()` 而不给 `.bg()`
+    /// 就是纯模糊、不染色。
+    ///
+    /// 只有 wgpu 那条渲染路径（Android 与 Linux 桌面）真做模糊；Metal 与 DirectX 跳过
+    /// 玻璃那一层，屏上只剩 `.bg()` 的半透明，与不调这个方法一致。
+    fn backdrop_blur(mut self, radius: Pixels) -> Self {
+        self.style().backdrop_blur = Some(radius);
         self
     }
 

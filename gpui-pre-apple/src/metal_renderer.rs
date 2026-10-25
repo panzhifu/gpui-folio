@@ -817,12 +817,8 @@ impl MetalRenderer {
         layer_range: std::ops::Range<gpui::DrawOrder>,
         skip_curl: bool,
     ) -> Result<()> {
-        let mut command_encoder = new_command_encoder_for_texture(
-            command_buffer,
-            texture,
-            viewport_size,
-            clear_color,
-        );
+        let mut command_encoder =
+            new_command_encoder_for_texture(command_buffer, texture, viewport_size, clear_color);
         if let Some(bounds) = capture_bounds {
             let scissor = crate::page_curl::scissor_rect(&bounds, viewport_size);
             if scissor.width > 0 && scissor.height > 0 {
@@ -909,6 +905,11 @@ impl MetalRenderer {
                         viewport_size,
                         None,
                     );
+                }
+                PrimitiveBatch::BackdropGlasses(_) => {
+                    // 背景模糊只有 wgpu 那条渲染路径实现（Android 与 Linux 桌面）。这一端
+                    // 跳过玻璃：屏上只剩压在它上面的那层半透明 tint，与加这个 primitive
+                    // 之前逐像素相同。
                 }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
@@ -1399,7 +1400,8 @@ fn new_command_encoder_for_texture<'a>(
     texture: &'a metal::TextureRef,
     viewport_size: Size<DevicePixels>,
     clear_color: Option<metal::MTLClearColor>,
-) -> &'a metal::RenderCommandEncoderRef {    let render_pass_descriptor = metal::RenderPassDescriptor::new();
+) -> &'a metal::RenderCommandEncoderRef {
+    let render_pass_descriptor = metal::RenderPassDescriptor::new();
     let color_attachment = render_pass_descriptor
         .color_attachments()
         .object_at(0)

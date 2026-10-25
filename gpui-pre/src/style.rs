@@ -5,11 +5,11 @@ use std::{
 };
 
 use crate::{
-    AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
-    CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
-    point, px, quad, rems, size,
+    AbsoluteLength, App, BackdropGlass, Background, BackgroundTag, BorderStyle, Bounds,
+    ContentMask, Corners, CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges,
+    EdgesRefinement, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla,
+    Length, Pixels, Point, PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled,
+    TextRun, Window, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -277,6 +277,13 @@ pub struct Style {
 
     /// The fill color of this element
     pub background: Option<Fill>,
+
+    /// 这一格的**背景模糊**半径。`Pixels(0.)`（默认）= 不画玻璃。
+    ///
+    /// 玻璃只负责把底下已经画好的那一块模糊掉，颜色仍然由上面的 `background` 那一层
+    /// 半透明 tint 提供，所以两者可以各调各的。只有 wgpu 那条渲染路径真做模糊，
+    /// Metal 与 DirectX 会跳过玻璃、只剩 tint。
+    pub backdrop_blur: Pixels,
 
     /// The border color of this element
     pub border_color: Option<Hsla>,
@@ -711,6 +718,15 @@ impl Style {
         window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
 
         let background_color = self.background.as_ref().and_then(Fill::color);
+        if self.backdrop_blur.0 > 0. {
+            // 玻璃画在 tint quad **之前**，于是它的 order 比 tint 与全部子元素都低：
+            // 渲染器就在这一处把主 pass 切开，底下那一块进模糊，tint 与字都压在结果上。
+            window.paint_backdrop_glass(BackdropGlass {
+                bounds,
+                corner_radii,
+                blur_radius: self.backdrop_blur,
+            });
+        }
         if background_color.is_some_and(|color| !color.is_transparent()) {
             let mut border_color = match background_color {
                 Some(color) => match color.tag {
@@ -780,6 +796,7 @@ impl Default for Style {
             allow_concurrent_scroll: false,
             restrict_scroll_to_axis: false,
             scrollbar_width: AbsoluteLength::default(),
+            backdrop_blur: px(0.),
             position: Position::Relative,
             inset: Edges::auto(),
             margin: Edges::<Length>::zero(),
