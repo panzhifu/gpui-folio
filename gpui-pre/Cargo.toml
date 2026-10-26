@@ -660,3 +660,7 @@ priority = -1
 [lints.rust.unexpected_cfgs]
 level = "allow"
 priority = 0
+
+[[example]]
+name = "capture_order_probe"
+path = "examples/capture_order_probe.rs"

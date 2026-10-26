@@ -474,6 +474,12 @@ impl<'a> Iterator for BatchIterator<'a> {
             self.backdrop_glasses_iter.next();
             self.backdrop_glasses_start += 1;
         }
+        // 这一批到这为止的两个边界：`max_order_and_kind` 只给出「下一个更晚的 primitive
+        // 在哪个 kind 里」。当这一批之后**再没有别的 kind** 时它是 `u32::MAX`，同一数组里
+        // 区间外的 primitive 就会被整批吞掉 —— 主 pass 的最后一个 sprite 批次因此把捕获层
+        // 1 的副本字一并取走，与正文错开一截印两遍（真机录屏量到、`capture_order_probe`
+        // 钉住：修前 main `0..13` / capture `10..13`，修后 `0..10` / `10..13`）。
+        // 所以每个 `next_if` 除了问 kind 顺序，还要再问一次这条 primitive 在不在本区间。
         let mut orders_and_kinds = [
             (
                 self.shadows_iter.peek().map(|s| s.order),
@@ -527,7 +533,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.shadows_iter.next();
                 while self
                     .shadows_iter
-                    .next_if(|shadow| (shadow.order, batch_kind) < max_order_and_kind)
+                    .next_if(|shadow| {
+                        self.range.contains(&shadow.order)
+                            && (shadow.order, batch_kind) < max_order_and_kind
+                    })
                     .is_some()
                 {
                     shadows_end += 1;
@@ -541,7 +550,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.quads_iter.next();
                 while self
                     .quads_iter
-                    .next_if(|quad| (quad.order, batch_kind) < max_order_and_kind)
+                    .next_if(|quad| {
+                        self.range.contains(&quad.order)
+                            && (quad.order, batch_kind) < max_order_and_kind
+                    })
                     .is_some()
                 {
                     quads_end += 1;
@@ -555,7 +567,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.paths_iter.next();
                 while self
                     .paths_iter
-                    .next_if(|path| (path.order, batch_kind) < max_order_and_kind)
+                    .next_if(|path| {
+                        self.range.contains(&path.order)
+                            && (path.order, batch_kind) < max_order_and_kind
+                    })
                     .is_some()
                 {
                     paths_end += 1;
@@ -569,7 +584,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.underlines_iter.next();
                 while self
                     .underlines_iter
-                    .next_if(|underline| (underline.order, batch_kind) < max_order_and_kind)
+                    .next_if(|underline| {
+                        self.range.contains(&underline.order)
+                            && (underline.order, batch_kind) < max_order_and_kind
+                    })
                     .is_some()
                 {
                     underlines_end += 1;
@@ -585,7 +603,8 @@ impl<'a> Iterator for BatchIterator<'a> {
                 while self
                     .monochrome_sprites_iter
                     .next_if(|sprite| {
-                        (sprite.order, batch_kind) < max_order_and_kind
+                        self.range.contains(&sprite.order)
+                            && (sprite.order, batch_kind) < max_order_and_kind
                             && sprite.tile.texture_id == texture_id
                     })
                     .is_some()
@@ -606,7 +625,8 @@ impl<'a> Iterator for BatchIterator<'a> {
                 while self
                     .subpixel_sprites_iter
                     .next_if(|sprite| {
-                        (sprite.order, batch_kind) < max_order_and_kind
+                        self.range.contains(&sprite.order)
+                            && (sprite.order, batch_kind) < max_order_and_kind
                             && sprite.tile.texture_id == texture_id
                     })
                     .is_some()
@@ -627,7 +647,8 @@ impl<'a> Iterator for BatchIterator<'a> {
                 while self
                     .polychrome_sprites_iter
                     .next_if(|sprite| {
-                        (sprite.order, batch_kind) < max_order_and_kind
+                        self.range.contains(&sprite.order)
+                            && (sprite.order, batch_kind) < max_order_and_kind
                             && sprite.tile.texture_id == texture_id
                     })
                     .is_some()
@@ -646,7 +667,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_iter.next();
                 while self
                     .surfaces_iter
-                    .next_if(|surface| (surface.order, batch_kind) < max_order_and_kind)
+                    .next_if(|surface| {
+                        self.range.contains(&surface.order)
+                            && (surface.order, batch_kind) < max_order_and_kind
+                    })
                     .is_some()
                 {
                     surfaces_end += 1;
@@ -660,7 +684,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.page_curl_meshes_iter.next();
                 while self
                     .page_curl_meshes_iter
-                    .next_if(|mesh| (mesh.order, batch_kind) < max_order_and_kind)
+                    .next_if(|mesh| {
+                        self.range.contains(&mesh.order)
+                            && (mesh.order, batch_kind) < max_order_and_kind
+                    })
                     .is_some()
                 {
                     meshes_end += 1;
@@ -674,7 +701,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.backdrop_glasses_iter.next();
                 while self
                     .backdrop_glasses_iter
-                    .next_if(|glass| (glass.order, batch_kind) < max_order_and_kind)
+                    .next_if(|glass| {
+                        self.range.contains(&glass.order)
+                            && (glass.order, batch_kind) < max_order_and_kind
+                    })
                     .is_some()
                 {
                     glasses_end += 1;
