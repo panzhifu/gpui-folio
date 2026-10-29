@@ -1522,7 +1522,11 @@ float4 page_curl_fragment(PageCurlVertexOutput input) : SV_Target0 {
     float side = clamp(0.5 + (turn - past) / (2.0 * w), 0.0, 1.0);
     float3 curled = lerp(back, front, side);
     // 纸边光。两样都不乘 shadow map 那一道（母本同口径：投影是几何自己那趟）。
-    float3 rim = float3(0.06 * (1.0 - smoothstep(0.0, 2.0, input.edge)));
+    // 单标量灌进向量：写成 `float3(x)` 在 fxc（vs_4_1）上会报 X3014
+    // 「incorrect number of arguments to numeric-type constructor」，所以先落成一个
+    // 标量再按三个分量写 —— 语义完全一样，任何 HLSL 编译器都收。
+    float rim_amount = 0.06 * (1.0 - smoothstep(0.0, 2.0, input.edge));
+    float3 rim = float3(rim_amount, rim_amount, rim_amount);
     float3 lit = curled + rim;
     float3 flat_color = paper;
     return float4(lerp(flat_color, lit, smoothstep(-w, w, past)), 1.0);
