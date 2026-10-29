@@ -1347,7 +1347,7 @@ float page_curl_radius_at(float2 p) {
     float denom_safe = abs(denom) > 1.0 ? denom : 1.0;
     float cone = clamp(cu_radius * (s - cu_cone_a.x) / denom_safe,
                        cu_cone_a.w, cu_cone_b.x);
-    return max(mix(cu_radius, cone, clamp(cu_cone_a.z, 0.0, 1.0)), 0.001);
+    return max(lerp(cu_radius, cone, clamp(cu_cone_a.z, 0.0, 1.0)), 0.001);
 }
 
 static void page_curl_deform(float2 page_position, out float3 position,
@@ -1515,15 +1515,15 @@ float4 page_curl_fragment(PageCurlVertexOutput input) : SV_Target0 {
     float3 bleed = t_page_capture.Sample(s_page_curl, clamp(bleed_uv, uv_min, uv_max)).rgb;
     float back_fade = clamp((theta - PAGE_CURL_PI) / 1.5, 0.0, 1.0);
     float3 back = (cu_back_color.rgb + (bleed - cu_back_color.rgb) * PAGE_CURL_BLEED)
-        * mix(0.985, 1.0, min(back_fade * 6.0, 1.0));
+        * lerp(0.985, 1.0, min(back_fade * 6.0, 1.0));
 
     // 正面 ↔ 背面：θ = π/2 那一点法向过零，用现算 past 做两像素过渡。
     float turn = PAGE_CURL_PI * r * 0.5;
     float side = clamp(0.5 + (turn - past) / (2.0 * w), 0.0, 1.0);
-    float3 curled = mix(back, front, side);
+    float3 curled = lerp(back, front, side);
     // 纸边光。两样都不乘 shadow map 那一道（母本同口径：投影是几何自己那趟）。
     float3 rim = float3(0.06 * (1.0 - smoothstep(0.0, 2.0, input.edge)));
     float3 lit = curled + rim;
     float3 flat_color = paper;
-    return float4(mix(flat_color, lit, smoothstep(-w, w, past)), 1.0);
+    return float4(lerp(flat_color, lit, smoothstep(-w, w, past)), 1.0);
 }
