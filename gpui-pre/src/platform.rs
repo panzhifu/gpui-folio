@@ -1493,6 +1493,30 @@ pub trait PlatformDispatcher: Send + Sync {
 #[expect(missing_docs)]
 pub trait PlatformTextSystem: Send + Sync {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()>;
+
+    /// Like [`Self::add_fonts`], but returns the family names the font database
+    /// reports for each source.
+    ///
+    /// A batch registration must know which families belong to which font; doing
+    /// that by diffing [`Self::all_font_names`] before and after a *batch* cannot
+    /// tell the sources apart. The default implementation keeps the old behavior
+    /// (one source at a time, diff the names); backends with direct access to the
+    /// database should override it and read the names from the loaded faces.
+    fn add_fonts_with_families(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<Vec<Vec<String>>> {
+        let mut out = Vec::with_capacity(fonts.len());
+        for bytes in fonts {
+            let before = self.all_font_names();
+            self.add_fonts(vec![bytes])?;
+            let after = self.all_font_names();
+            out.push(
+                after
+                    .into_iter()
+                    .filter(|name| !before.iter().any(|old| old == name))
+                    .collect(),
+            );
+        }
+        Ok(out)
+    }
     /// Installs a nonblocking sink for unresolved grapheme clusters.
     fn set_missing_glyph_sink(&self, _sink: Option<Arc<dyn MissingGlyphSink>>) {}
     /// Get all available font names.

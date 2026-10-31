@@ -55,8 +55,9 @@ struct CosmicTextSystemState {
     loaded_fonts: Vec<LoadedFont>,
     loaded_font_ids_by_key: HashMap<LoadedFontKey, FontId>,
     /// Caches the `FontId`s associated with a specific family to avoid iterating the font database
-    /// for every font face in a family.
-    font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
+    /// for every font face in a family. The bool is `allow_no_latin`: primary lookups (false)
+    /// filter faces without `m`, fallback lookups (true) keep them.
+    font_ids_by_family_cache: HashMap<(FontKey, bool), SmallVec<[FontId; 4]>>,
     system_font_fallback: String,
     missing_glyph_sink: Option<Arc<dyn MissingGlyphSink>>,
 }
@@ -169,6 +170,13 @@ impl PlatformTextSystem for CosmicTextSystem {
         self.0.write().add_fonts(fonts)
     }
 
+    fn add_fonts_with_families(
+        &self,
+        fonts: Vec<Cow<'static, [u8]>>,
+    ) -> Result<Vec<Vec<String>>> {
+        self.0.write().add_fonts_with_families(fonts)
+    }
+
     fn set_missing_glyph_sink(&self, sink: Option<Arc<dyn MissingGlyphSink>>) {
         self.0.write().missing_glyph_sink = sink;
     }
@@ -194,13 +202,19 @@ impl PlatformTextSystem for CosmicTextSystem {
             font.features.clone(),
             font.fallbacks.clone(),
         );
-        let candidates = if let Some(font_ids) = state.font_ids_by_family_cache.get(&key) {
+        let candidates = if let Some(font_ids) = state.font_ids_by_family_cache.get(&(key.clone(), false)) {
             font_ids.as_slice()
         } else {
-            let font_ids =
-                state.load_family(&font.family, &font.features, font.fallbacks.as_ref())?;
-            state.font_ids_by_family_cache.insert(key.clone(), font_ids);
-            state.font_ids_by_family_cache[&key].as_ref()
+            let font_ids = state.load_family(
+                &font.family,
+                &font.features,
+                font.fallbacks.as_ref(),
+                false,
+            )?;
+            state
+                .font_ids_by_family_cache
+                .insert((key.clone(), false), font_ids);
+            state.font_ids_by_family_cache[&(key, false)].as_ref()
         };
 
         let ix = find_best_match(font, candidates, &state)?;
@@ -335,12 +349,43 @@ impl CosmicTextSystemState {
         Ok(())
     }
 
+    /// Batch registration with exact per-source family names from fontdb.
+    ///
+    /// `load_font_source` returns the IDs of the faces it inserted; reading their
+    /// `families` is the only way to tell a batch's sources apart (a before/after
+    /// `all_font_names` diff cannot).
+    #[profiling::function]
+    fn add_fonts_with_families(
+        &mut self,
+        fonts: Vec<Cow<'static, [u8]>>,
+    ) -> Result<Vec<Vec<String>>> {
+        self.font_ids_by_family_cache.clear();
+        let db = self.font_system.db_mut();
+        let mut out = Vec::with_capacity(fonts.len());
+        for bytes in fonts {
+            let ids = db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)));
+            let mut families: Vec<String> = Vec::new();
+            for id in ids {
+                if let Some(face) = db.face(id) {
+                    for (family, _) in &face.families {
+                        if !families.contains(family) {
+                            families.push(family.clone());
+                        }
+                    }
+                }
+            }
+            out.push(families);
+        }
+        Ok(out)
+    }
+
     #[profiling::function]
     fn load_family(
         &mut self,
         name: &str,
         features: &FontFeatures,
         fallbacks: Option<&FontFallbacks>,
+        allow_no_latin: bool,
     ) -> Result<SmallVec<[FontId; 4]>> {
         let loaded_font_key = FontKey::new(
             SharedString::from(name.to_owned()),
@@ -360,12 +405,15 @@ impl CosmicTextSystemState {
                         features.clone(),
                         None,
                     );
-                    let fb_ids = if let Some(cached) = self.font_ids_by_family_cache.get(&fb_key) {
+                    let fb_cache_key = (fb_key, true);
+                    let fb_ids = if let Some(cached) =
+                        self.font_ids_by_family_cache.get(&fb_cache_key)
+                    {
                         cached.clone()
                     } else {
-                        let loaded = self.load_family(fallback_name, features, None)?;
+                        let loaded = self.load_family(fallback_name, features, None, true)?;
                         self.font_ids_by_family_cache
-                            .insert(fb_key.clone(), loaded.clone());
+                            .insert(fb_cache_key, loaded.clone());
                         loaded
                     };
                     let Some(&fb_id) = fb_ids.first() else {
@@ -426,7 +474,14 @@ impl CosmicTextSystemState {
             // and emoji fonts often have no Latin glyphs, and they are exactly
             // what cosmic-text falls back to when the primary font lacks a
             // glyph.
-            if font.as_swash().charmap().map('m') == 0
+            // Primary lookups (allow_no_latin = false) keep the editor's `m`
+            // requirement. Fallback lookups keep no-`m` faces: a CJK-only face
+            // can still cover glyphs the primary font lacks, and cosmic-text
+            // would otherwise have no way to reach it. This is the difference
+            // between "the face can't be the primary" and "the face is
+            // unusable".
+            if !allow_no_latin
+                && font.as_swash().charmap().map('m') == 0
                 && !allowed_bad_font_names.contains(&postscript_name.as_str())
             {
                 continue;

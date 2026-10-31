@@ -300,6 +300,22 @@ impl TextSystem {
         Ok(())
     }
 
+    /// Add fonts and return the family names the platform database reported for
+    /// each source (outer index = source, inner = families).
+    ///
+    /// Use this instead of [`Self::add_fonts`] when the caller has to map a source
+    /// to its own family names (a reader registering a book's embedded fonts).
+    pub fn add_fonts_with_families(
+        &self,
+        fonts: Vec<Cow<'static, [u8]>>,
+    ) -> Result<Vec<Vec<String>>> {
+        let families = self.platform_text_system.add_fonts_with_families(fonts)?;
+        self.font_ids_by_font.write().clear();
+        self.missing_glyph_reporter.reset();
+        self.font_generation.fetch_add(1, Ordering::Release);
+        Ok(families)
+    }
+
     /// Takes the receiver for missing-glyph reports.
     ///
     /// Only one receiver is available for each text system. Returns `None` when
@@ -368,13 +384,8 @@ impl TextSystem {
     ///
     /// Panics if the font and none of the fallbacks can be resolved.
     pub fn resolve_font(&self, font: &Font) -> FontId {
-        if let Ok(font_id) = self.font_id(font) {
+        if let Ok(font_id) = self.try_resolve_font(font) {
             return font_id;
-        }
-        for fallback in &self.fallback_font_stack {
-            if let Ok(font_id) = self.font_id(fallback) {
-                return font_id;
-            }
         }
 
         panic!(
@@ -385,6 +396,45 @@ impl TextSystem {
                 .map(|fallback| &fallback.family)
                 .join(", ")
         );
+    }
+
+    /// Like [`Self::resolve_font`], but reports a missing font instead of
+    /// panicking.
+    ///
+    /// This is the fallible entry point callers use when the family name came
+    /// from a book or a config file (where a typo is data, not a bug).
+    pub fn try_resolve_font(&self, font: &Font) -> Result<FontId> {
+        if let Ok(font_id) = self.font_id(font) {
+            return Ok(font_id);
+        }
+        for fallback in &self.fallback_font_stack {
+            if let Ok(font_id) = self.font_id(fallback) {
+                return Ok(font_id);
+            }
+        }
+        Err(anyhow!(
+            "failed to resolve font '{}' or any of the fallbacks: {}",
+            font.family,
+            self.fallback_font_stack
+                .iter()
+                .map(|fallback| &fallback.family)
+                .join(", ")
+        ))
+    }
+
+    /// Whether the font selected by `font` itself (no global fallback stack)
+    /// has a glyph for `ch`.
+    ///
+    /// This is a real lookup in the font database: it resolves the family,
+    /// loads the face, and asks its character map. Device fonts can therefore be
+    /// checked without holding their bytes. Returns `false` when the family
+    /// cannot be resolved, which includes faces a platform filters out of the
+    /// primary set.
+    pub fn font_has_glyph(&self, font: &Font, ch: char) -> bool {
+        self.font_id(font)
+            .ok()
+            .and_then(|font_id| self.platform_text_system.glyph_for_char(font_id, ch))
+            .is_some()
     }
 
     /// Prewarm any system font caches needed to shape text.
