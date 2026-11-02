@@ -1286,7 +1286,8 @@ float4 fill_color(Background background,
 //   - uniform 的字节布局与 Rust 侧 GpuCurlUniforms（240 字节）逐格对应，[f32;3]
 //     补位格写成 C 数组 —— MSL 的 float3 是 16 字节对齐，直接用会多出 4 字节空洞。
 //   - 绑定表是本段私有的：buffer(0) 顶点、buffer(1) uniform、buffer(2) viewport、
-//     texture(0) 正面捕获、texture(1) shadow map、texture(2) 背面捕获。
+//     texture(0) 正面捕获、texture(1) shadow map、texture(2) 背面捕获、
+//     texture(3) 进场页捕获。
 
 constant float PAGE_CURL_PI = 3.141592653589793;
 // 阴影比较的偏置：8 位 shadow map 一档 = 1/255 ≈ 0.0039，取一档多一点，
@@ -1309,7 +1310,8 @@ struct CurlGpuUniforms {
   float4 cone_a;               //  80
   float4 cone_b;               //  96
   float2 capture_origin;       // 112
-  float2 _padding;             // 120
+  float incoming;              // 120
+  float _padding;              // 124
   float shadow_map_size;       // 128
   float _pad0[3];              // 132
   float _pad1[3];              // 144
@@ -1493,15 +1495,21 @@ fragment PageCurlFragmentOut fs_page_curl(
     texture2d<float> capture_texture [[texture(0)]],
     texture2d<float> shadow_texture [[texture(1)]],
     texture2d<float> back_texture [[texture(2)]],
+    texture2d<float> incoming_texture [[texture(3)]],
     sampler capture_sampler [[sampler(0)]],
     sampler shadow_sampler [[sampler(1)]],
-    sampler back_sampler [[sampler(2)]]) {
+    sampler back_sampler [[sampler(2)]],
+    sampler incoming_sampler [[sampler(3)]]) {
   // 捕获纹理整窗大小、只有页面矩形那块被写过：取 uv 往矩形内收半像素。
   float2 uv_min = (curl->capture_origin + float2(0.5)) / curl->window_size;
   float2 uv_max = (curl->capture_origin + curl->page_size - float2(0.5)) / curl->window_size;
   float2 capture_uv = clamp(in.uv, uv_min, uv_max);
-  // 全场唯一一次正面采样。
+  // 全场唯一一次正面采样。平摊的进场页网格把 `incoming` 置 1，改采第三张纹理；
+  // 它同样走下面 `past <= -w` 的平摊分支，背面透墨那一段不参与。
   float3 paper = capture_texture.sample(capture_sampler, capture_uv, level(0)).rgb;
+  if (curl->incoming > 0.5) {
+    paper = incoming_texture.sample(incoming_sampler, capture_uv, level(0)).rgb;
+  }
 
   // past 不用顶点插值的那一份，从材质坐标逐像素现算 —— 等值线才是解析直线
   // （母本注释里有真机量出来的台阶案例）。

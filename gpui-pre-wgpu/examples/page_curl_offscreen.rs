@@ -68,6 +68,23 @@ fn main() -> anyhow::Result<()> {
         });
     }
     scene.page_capture = Some(bounds);
+    // 背面与进场页也各请求一张：三张纹理都到位，group 2 的六绑定才建得出来。
+    scene.page_capture_back = Some(bounds);
+    scene.page_capture_incoming = Some(bounds);
+    // 进场页纹理里放一块纯白：下面网格把 `incoming` 置 1，卷起来那一段若读到白色，
+    // 就说明第三张捕获纹理、绑定点与 uniform 的 120 偏移全对上了。
+    scene.set_capture_layer(3);
+    scene.quads.push(Quad {
+        order: 0,
+        border_style: Default::default(),
+        bounds,
+        content_mask: ContentMask { bounds },
+        background: gpui::white().into(),
+        border_color: Hsla::transparent_black(),
+        corner_radii: Default::default(),
+        border_widths: Default::default(),
+    });
+    scene.set_capture_layer(0);
     scene.page_curl_meshes.push(PageCurlMeshPrimitive {
         order: 1,
         bounds,
@@ -120,7 +137,11 @@ fn main() -> anyhow::Result<()> {
             scale_factor: 1.0,
             back_color: [0.92, 0.9, 0.86, 1.0],
             light_dir: [-0.35, -0.25, 1.0, 0.0],
+            cone_a: [0.0; 4],
+            cone_b: [0.0; 4],
             capture_origin: [0.0, 0.0],
+            incoming: 1.0,
+            back_capture_origin: [0.0, 0.0],
         },
     });
 

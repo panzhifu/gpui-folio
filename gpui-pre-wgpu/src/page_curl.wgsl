@@ -52,8 +52,10 @@ struct CurlUniforms {
     /// 阅读层在动（进出书的滑动、面板、尺寸变化）时这两个不是同一个数，而纹理里被写过的
     /// 只有烘的那一刻那一块 —— 混用就会采到未写区域（读成黑带）。
     capture_origin: vec2<f32>,
-    /// 保持 uniform 结构体 16 字节对齐；没有语义。
-    _padding: vec2<f32>,
+    /// 平摊网格采哪一张捕获纹理：`0` = 正面（出场页），`1` = 进场页纹理。
+    /// 卷曲网格与出场页的平摊网格恒为 0；它与下一格一起保持 16 字节对齐。
+    incoming: f32,
+    _padding: f32,
     /// shadow map 的边长（像素），PCF 的纹素步长。
     shadow_map_size: f32,
     _pad1: vec3<f32>,
@@ -66,14 +68,16 @@ struct CurlUniforms {
 
 @group(1) @binding(0) var<uniform> curl: CurlUniforms;
 
-// 正面捕获与背面捕获挤进同一组：适配器报的 max_bind_groups 有只有 4 的（Adreno 的
-// Vulkan 驱动实测），globals + uniforms + 两张捕获 + shadow map 一共 5 组就超了一格，
-// 超一格不是某一趟画不出，而是 create_shader_module 当场验证失败、整个 Vulkan 设备
-// 被拒、全应用退到 GL。四绑定一组把总数压回 4。
+// 正面、背面与进场页三张捕获纹理挤进同一组：适配器报的 max_bind_groups 有只有 4 的
+// （Adreno 的 Vulkan 驱动实测），globals + uniforms + 捕获纹理 + shadow map 一共 5 组
+// 就超了一格，超一格不是某一趟画不出，而是 create_shader_module 当场验证失败、整个
+// Vulkan 设备被拒、全应用退到 GL。六绑定一组把总数压回 4。
 @group(2) @binding(0) var capture_texture: texture_2d<f32>;
 @group(2) @binding(1) var capture_sampler: sampler;
 @group(2) @binding(2) var back_texture: texture_2d<f32>;
 @group(2) @binding(3) var back_sampler: sampler;
+@group(2) @binding(4) var incoming_texture: texture_2d<f32>;
+@group(2) @binding(5) var incoming_sampler: sampler;
 
 @group(3) @binding(0) var shadow_texture: texture_2d<f32>;
 @group(3) @binding(1) var shadow_sampler: sampler;
@@ -265,8 +269,12 @@ fn fs_page_curl(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv_min = (curl.capture_origin + vec2<f32>(0.5)) / curl.window_size;
     let uv_max = (curl.capture_origin + curl.page_size - vec2<f32>(0.5)) / curl.window_size;
     let capture_uv = clamp(in.uv, uv_min, uv_max);
-    // 全场唯一一次正面采样。
-    let paper = textureSampleLevel(capture_texture, capture_sampler, capture_uv, 0.0).rgb;
+    // 全场唯一一次正面采样。平摊的进场页网格把 `incoming` 置 1，改采第三张纹理；
+    // 它同样走下面 `past <= -w` 的平摊分支，背面透墨那一段不参与。
+    var paper = textureSampleLevel(capture_texture, capture_sampler, capture_uv, 0.0).rgb;
+    if (curl.incoming > 0.5) {
+        paper = textureSampleLevel(incoming_texture, incoming_sampler, capture_uv, 0.0).rgb;
+    }
 
     // **这一格是整段的关键**：`past` 不用顶点传进来的那一份，而是从 `uv` 现算。
     //

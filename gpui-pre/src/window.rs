@@ -4902,6 +4902,18 @@ impl Window {
         scene.page_capture_back_clear_color = Some(clear_color);
     }
 
+    /// 进场页那一页的捕获请求（第 3 层）。与正面、背面同一套口径，渲染器写第三张纹理。
+    pub fn capture_page_region_incoming_with_color(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        clear_color: crate::Rgba,
+    ) {
+        let capture = bounds.scale(self.scale_factor());
+        let scene = &mut self.next_frame.scene;
+        scene.page_capture_incoming = Some(capture);
+        scene.page_capture_incoming_clear_color = Some(clear_color);
+    }
+
     /// 绘制回调里切捕获层：之后的 primitive 排到 `layer` 的高 order 段，主 pass 跳过。
     /// `0` = 回到主场景。调用方必须在同一次绘制里切回 `0`，否则后续内容全被藏起来。
     ///

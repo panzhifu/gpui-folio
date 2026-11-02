@@ -360,6 +360,7 @@ impl DirectXRenderer {
             _ => [0.0f32; 4],
         })?;
         self.upload_scene_buffers(scene)?;
+        self.encode_page_captures(scene)?;
 
         let annotation = self
             .devices
@@ -485,6 +486,67 @@ impl DirectXRenderer {
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
             }
             .with_context(|| "drawing batch in capture pass".to_string())?;
+        }
+        Ok(())
+    }
+
+    /// 把第 1/2/3 层捕获各画进自己的离屏纹理，然后接回主颜色附件。
+    ///
+    /// 与 wgpu/Metal 同一顺序：捕获在 `pre_draw` 清完主 RT 之后、主批次之前。
+    /// 捕获 pass 只取本层的 primitive，跳过卷曲网格，防止采样到自己。
+    fn encode_page_captures(&mut self, scene: &Scene) -> Result<()> {
+        if self.page_curl.is_none() {
+            return Ok(());
+        }
+        let size = Size::new(
+            DevicePixels(self.width.max(1) as i32),
+            DevicePixels(self.height.max(1) as i32),
+        );
+        for (layer, bounds, clear) in [
+            (0u8, scene.page_capture, scene.page_capture_clear_color),
+            (
+                1u8,
+                scene.page_capture_back,
+                scene.page_capture_back_clear_color,
+            ),
+            (
+                2u8,
+                scene.page_capture_incoming,
+                scene.page_capture_incoming_clear_color,
+            ),
+        ] {
+            let Some(bounds) = bounds else {
+                continue;
+            };
+            {
+                let devices = self.devices.as_ref().context("devices missing")?;
+                let (_, page_curl) = self
+                    .page_curl
+                    .as_mut()
+                    .context("page_curl missing")?;
+                page_curl.bind_capture(
+                    &devices.device,
+                    &devices.device_context,
+                    layer,
+                    size,
+                    capture_clear_color(clear),
+                )?;
+            }
+            self.draw_batches_in(scene, bounds, gpui::capture_order_range(layer + 1), true)?;
+        }
+        // 捕获 pass 换过 OM 绑定与视口：接回主 RT 再让主批次画。
+        {
+            let devices = self.devices.as_ref().context("devices missing")?;
+            let resources = self.resources.as_ref().context("resources missing")?;
+            unsafe {
+                devices.device_context.OMSetRenderTargets(
+                    Some(slice::from_ref(&resources.render_target_view)),
+                    None,
+                );
+                devices
+                    .device_context
+                    .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+            }
         }
         Ok(())
     }
@@ -2194,7 +2256,8 @@ struct GpuCurlUniforms {
     cone_a: [f32; 4],
     cone_b: [f32; 4],
     capture_origin: [f32; 2],
-    _padding: [f32; 2],
+    incoming: f32,
+    _padding: f32,
     shadow_map_size: f32,
     _pad0: [f32; 3],
     _pad1: [f32; 3],
@@ -2207,6 +2270,7 @@ struct GpuCurlUniforms {
 const _: () = {
     use std::mem::{offset_of, size_of};
     assert!(size_of::<GpuCurlUniforms>() == 240);
+    assert!(offset_of!(GpuCurlUniforms, incoming) == 120);
     assert!(offset_of!(GpuCurlUniforms, shadow_map_size) == 128);
     assert!(offset_of!(GpuCurlUniforms, light_view_proj) == 160);
     assert!(offset_of!(GpuCurlUniforms, back_capture_origin) == 224);
@@ -2227,6 +2291,7 @@ struct PageCurlResources {
     depth_state: ID3D11DepthStencilState,
     capture: Option<PageCurlCapture>,
     back_capture: Option<PageCurlCapture>,
+    incoming_capture: Option<PageCurlCapture>,
     depth: Option<(ID3D11Texture2D, ID3D11DepthStencilView, Size<DevicePixels>)>,
     shadow: Option<PageCurlShadowMap>,
     geometry: Option<PageCurlGeometry>,
@@ -2325,6 +2390,7 @@ impl PageCurlResources {
             depth_state: depth_state.unwrap(),
             capture: None,
             back_capture: None,
+            incoming_capture: None,
             depth: None,
             shadow: None,
             geometry: None,
@@ -2336,6 +2402,7 @@ impl PageCurlResources {
     pub(crate) fn invalidate(&mut self) {
         self.capture = None;
         self.back_capture = None;
+        self.incoming_capture = None;
         self.depth = None;
         self.shadow = None;
         self.geometry = None;
@@ -2491,19 +2558,20 @@ impl PageCurlResources {
         Ok(())
     }
 
-    /// 正面/背面捕获纹理（整窗大小、格式与主目标一致），绑定为渲染目标并清成纸色。
+    /// 第 `layer` 层的捕获纹理（整窗大小、格式与主目标一致），绑定为渲染目标并清成纸色。
+    /// `0` = 正面（出场页）、`1` = 背面（折页的纸背）、`2` = 进场页。
     pub(crate) fn bind_capture(
         &mut self,
         device: &ID3D11Device,
         device_context: &ID3D11DeviceContext,
-        back: bool,
+        layer: u8,
         size: Size<DevicePixels>,
         clear_color: [f32; 4],
     ) -> Result<()> {
-        let slot = if back {
-            &mut self.back_capture
-        } else {
-            &mut self.capture
+        let slot = match layer {
+            0 => &mut self.capture,
+            1 => &mut self.back_capture,
+            _ => &mut self.incoming_capture,
         };
         let needs_new = slot
             .as_ref()
@@ -2603,6 +2671,12 @@ impl PageCurlResources {
         let Some(back_capture) = self.back_capture.as_ref() else {
             return Ok(());
         };
+        // 进场页纹理是懒创建的：还没请求过时先绑正面，着色器只在 `incoming = 1`
+        // 的平摊网格上采它，那种网格出现时这张纹理已经建好了。
+        let incoming = self
+            .incoming_capture
+            .as_ref()
+            .map_or(&capture.srv, |incoming| &incoming.srv);
         let Some(uniforms) = self.frame_uniforms else {
             return Ok(());
         };
@@ -2629,6 +2703,7 @@ impl PageCurlResources {
             device_context.PSSetConstantBuffers(2, Some(&[Some(self.uniform_buffer.clone())][..]));
             device_context.PSSetShaderResources(2, Some(&[Some(capture.srv.clone())][..]));
             device_context.PSSetShaderResources(4, Some(&[Some(back_capture.srv.clone())][..]));
+            device_context.PSSetShaderResources(5, Some(&[Some(incoming.clone())][..]));
             device_context.PSSetSamplers(1, Some(&[Some(self.sampler.clone())][..]));
             device_context.DrawIndexed(frame.index_count as u32, 0, 0);
             // 深度解绑恢复：主 pass 其余批次没有深度语义。
@@ -2655,7 +2730,8 @@ impl GpuCurlUniforms {
             cone_a: uniforms.cone_a,
             cone_b: uniforms.cone_b,
             capture_origin: uniforms.capture_origin,
-            _padding: [0.0; 2],
+            incoming: uniforms.incoming,
+            _padding: 0.0,
             shadow_map_size: PAGE_CURL_SHADOW_MAP_SIZE as f32,
             _pad0: [0.0; 3],
             _pad1: [0.0; 3],
@@ -2668,6 +2744,12 @@ impl GpuCurlUniforms {
 }
 
 /// 离屏纹理 + RTV。捕获用主目标同格式，shadow map 用 RGBA8，深度用 D32。
+fn capture_clear_color(color: Option<Rgba>) -> [f32; 4] {
+    color.map_or([1.0; 4], |color| {
+        [color.r, color.g, color.b, color.a]
+    })
+}
+
 fn page_curl_texture(
     device: &ID3D11Device,
     width: u32,

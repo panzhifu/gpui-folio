@@ -1275,7 +1275,7 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
 //     按 16 字节对齐，三个 float 会吃掉 48 字节，把后面全顶错。
 //   - 绑定表本段私有：t1 顶点（StructuredBuffer，DrawIndexed 的 vertex_id
 //     就是索引值）、b2 uniform、t2 正面捕获、t3 shadow map、t4 背面捕获、
-//     s1 最近邻采样器。
+//     t5 进场页捕获、s1 最近邻采样器。
 
 cbuffer CurlUniforms : register(b2) {
     float2 cu_page_origin;      //   0
@@ -1291,7 +1291,8 @@ cbuffer CurlUniforms : register(b2) {
     float4 cu_cone_a;           //  80
     float4 cu_cone_b;           //  96
     float2 cu_capture_origin;   // 112
-    float2 cu__padding;         // 120
+    float  cu_incoming;         // 120
+    float  cu__padding;         // 124
     float  cu_shadow_map_size;  // 128
     float  cu__pad0;            // 132
     float  cu__pad1;            // 136
@@ -1332,6 +1333,7 @@ struct PageCurlVertexOutput {
 Texture2D<float4> t_page_capture : register(t2);
 Texture2D<float4> t_page_shadow : register(t3);
 Texture2D<float4> t_page_back : register(t4);
+Texture2D<float4> t_page_incoming : register(t5);
 SamplerState s_page_curl : register(s1);
 
 static const float PAGE_CURL_PI = 3.141592653589793;
@@ -1480,8 +1482,12 @@ float4 page_curl_fragment(PageCurlVertexOutput input) : SV_Target0 {
     float2 uv_min = (cu_capture_origin + float2(0.5, 0.5)) / cu_window_size;
     float2 uv_max = (cu_capture_origin + cu_page_size - float2(0.5, 0.5)) / cu_window_size;
     float2 capture_uv = clamp(input.uv, uv_min, uv_max);
-    // 全场唯一一次正面采样。
+    // 全场唯一一次正面采样。平摊的进场页网格把 `cu_incoming` 置 1，改采 t5；
+    // 它同样走下面平摊分支，背面透墨那一段不参与。
     float3 paper = t_page_capture.Sample(s_page_curl, capture_uv).rgb;
+    if (cu_incoming > 0.5) {
+        paper = t_page_incoming.Sample(s_page_curl, capture_uv).rgb;
+    }
 
     // past 从材质坐标逐像素现算 —— 等值线是解析直线（母本注释里的台阶案例）。
     float2 local = input.material * cu_page_size;

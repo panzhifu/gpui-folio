@@ -783,6 +783,26 @@ impl MetalRenderer {
                 true,
             )?;
         }
+        if let Some(bounds) = scene.page_capture_incoming {
+            let clear_color = paper_clear_color(scene.page_capture_incoming_clear_color);
+            let incoming = self.page_curl.incoming_capture_view(
+                &self.device,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                viewport_size,
+            );
+            self.encode_batches(
+                scene,
+                instance_bindings,
+                writer,
+                &command_buffer,
+                &incoming,
+                viewport_size,
+                Some(clear_color),
+                Some(bounds),
+                gpui::capture_order_range(3),
+                true,
+            )?;
+        }
 
         // 主 pass：只画 < CAPTURE_ORDER_BASE；命中卷曲批次时暂停-补一趟-以 Load 恢复。
         self.encode_batches(

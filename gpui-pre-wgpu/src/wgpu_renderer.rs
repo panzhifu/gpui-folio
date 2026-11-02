@@ -1620,6 +1620,43 @@ impl WgpuRendererCore {
             )?;
         }
 
+        // 进场页：同一棵场景里第 3 层的 primitive，写第三张捕获纹理。平摊翻页里它和
+        // 出场页同时在场；层里没内容时只把纹理清成纸色，进场页照旧由主场景实时画。
+        if let Some(bounds) = scene.page_capture_incoming {
+            let incoming_view = {
+                let resources = &mut self.resources;
+                let device = &resources.device;
+                let layouts = &resources.bind_group_layouts;
+                resources
+                    .page_curl
+                    .incoming_capture_view(device, layouts, size)
+                    .clone()
+            };
+            let capture_clear = scene
+                .page_capture_incoming_clear_color
+                .map(|color| wgpu::Color {
+                    r: f64::from(color.r),
+                    g: f64::from(color.g),
+                    b: f64::from(color.b),
+                    a: f64::from(color.a),
+                })
+                .unwrap_or(wgpu::Color::WHITE);
+            self.encode_scene(
+                scene,
+                &mut encoder,
+                &incoming_view,
+                size,
+                capture_clear,
+                scissor_for(bounds, size),
+                true,
+                gpui::capture_order_range(3),
+                &instance_bindings,
+                &mut instance_offset,
+                false,
+                false,
+            )?;
+        }
+
         // 有玻璃就得先把整帧画进自有的中间纹理：表面的纹理既采不到也拷不出（原因写在
         // `backdrop` 模块头），画完再整张贴回表面。场景里没有玻璃时这条路径一步都不走，
         // 桌面端因此一个字节都不多花。

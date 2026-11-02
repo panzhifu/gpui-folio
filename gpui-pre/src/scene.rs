@@ -79,6 +79,11 @@ pub struct Scene {
     /// 背面那一页的捕获请求（第 2 层）。`None` = 这一帧不烘背面。
     pub page_capture_back: Option<Bounds<ScaledPixels>>,
     pub page_capture_back_clear_color: Option<Rgba>,
+    /// 进场页的捕获请求（第 3 层）。平摊翻页里进场页与出场页同时在屏上：出场页在
+    /// 正面纹理里，进场页在这一张。它不能与背面共用：双页折页的背面装的是目标跨页
+    /// 的另一半、进场页是再下一页，两者不是同一页。
+    pub page_capture_incoming: Option<Bounds<ScaledPixels>>,
+    pub page_capture_incoming_clear_color: Option<Rgba>,
     /// 当前绘制进哪一层捕获（0 = 主场景）。由 [`crate::Window::set_capture_layer`] 在
     /// 绘制回调里切；`insert_primitive` 据此把 order 推到对应的高段。
     pub capture_layer: u8,
@@ -105,6 +110,8 @@ impl Scene {
         self.page_capture_clear_color = None;
         self.page_capture_back = None;
         self.page_capture_back_clear_color = None;
+        self.page_capture_incoming = None;
+        self.page_capture_incoming_clear_color = None;
         self.capture_layer = 0;
         self.capture_counter = 0;
     }

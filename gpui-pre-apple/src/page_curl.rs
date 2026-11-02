@@ -27,7 +27,8 @@ struct GpuCurlUniforms {
     cone_a: [f32; 4],
     cone_b: [f32; 4],
     capture_origin: [f32; 2],
-    _padding: [f32; 2],
+    incoming: f32,
+    _padding: f32,
     shadow_map_size: f32,
     _pad0: [f32; 3],
     _pad1: [f32; 3],
@@ -40,6 +41,7 @@ struct GpuCurlUniforms {
 const _: () = {
     use std::mem::{offset_of, size_of};
     assert!(size_of::<GpuCurlUniforms>() == 240);
+    assert!(offset_of!(GpuCurlUniforms, incoming) == 120);
     assert!(offset_of!(GpuCurlUniforms, shadow_map_size) == 128);
     assert!(offset_of!(GpuCurlUniforms, light_view_proj) == 160);
     assert!(offset_of!(GpuCurlUniforms, back_capture_origin) == 224);
@@ -61,7 +63,8 @@ impl GpuCurlUniforms {
             cone_a: uniforms.cone_a,
             cone_b: uniforms.cone_b,
             capture_origin: uniforms.capture_origin,
-            _padding: [0.0; 2],
+            incoming: uniforms.incoming,
+            _padding: 0.0,
             shadow_map_size: SHADOW_MAP_SIZE as f32,
             _pad0: [0.0; 3],
             _pad1: [0.0; 3],
@@ -85,9 +88,11 @@ mod bind {
     pub const TEXTURE_CAPTURE: u64 = 0;
     pub const TEXTURE_SHADOW: u64 = 1;
     pub const TEXTURE_BACK: u64 = 2;
+    pub const TEXTURE_INCOMING: u64 = 3;
     pub const SAMPLER_CAPTURE: u64 = 0;
     pub const SAMPLER_SHADOW: u64 = 1;
     pub const SAMPLER_BACK: u64 = 2;
+    pub const SAMPLER_INCOMING: u64 = 3;
 }
 
 pub(super) struct PageCurlResources {
@@ -98,6 +103,7 @@ pub(super) struct PageCurlResources {
     frame_uniforms: Option<GpuCurlUniforms>,
     capture: Option<CaptureTexture>,
     back_capture: Option<CaptureTexture>,
+    incoming_capture: Option<CaptureTexture>,
     depth: Option<DepthTexture>,
     shadow: Option<ShadowMap>,
     geometry: Option<GeometryCache>,
@@ -175,6 +181,7 @@ impl PageCurlResources {
             frame_uniforms: None,
             capture: None,
             back_capture: None,
+            incoming_capture: None,
             depth: None,
             shadow: None,
             geometry: None,
@@ -236,6 +243,7 @@ impl PageCurlResources {
     pub(super) fn invalidate_size_dependent(&mut self) {
         self.capture = None;
         self.back_capture = None;
+        self.incoming_capture = None;
         self.depth = None;
         self.geometry = None;
         self.frame = None;
@@ -379,6 +387,31 @@ impl PageCurlResources {
         self.back_capture.as_ref().unwrap().texture.clone()
     }
 
+    /// 进场页捕获纹理（第 3 层），尺寸/格式与正面、背面一致。
+    pub(super) fn incoming_capture_view(
+        &mut self,
+        device: &metal::Device,
+        target_format: metal::MTLPixelFormat,
+        size: Size<DevicePixels>,
+    ) -> metal::Texture {
+        let needs_new = self
+            .incoming_capture
+            .as_ref()
+            .map(|capture| capture.size != size)
+            .unwrap_or(true);
+        if needs_new {
+            let texture = new_texture(
+                device,
+                target_format,
+                size.width.0.max(1) as u32,
+                size.height.0.max(1) as u32,
+                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+            );
+            self.incoming_capture = Some(CaptureTexture { texture, size });
+        }
+        self.incoming_capture.as_ref().unwrap().texture.clone()
+    }
+
     /// 把网格从光源方向渲染进 shadow map。必须在主 pass 之前调用。
     pub(super) fn encode_shadow(&self, command_buffer: &metal::CommandBufferRef) {
         let (Some(frame), Some(geometry), Some(shadow)) = (
@@ -455,6 +488,12 @@ impl PageCurlResources {
         let Some(uniforms) = self.frame_uniforms else {
             return;
         };
+        // 进场页纹理是懒创建的：还没请求过进场页捕获时先绑正面，着色器只在
+        // `incoming = 1` 的平摊网格上采它，那种网格出现时这张纹理已经建好了。
+        let incoming = self
+            .incoming_capture
+            .as_ref()
+            .map_or(&capture.texture, |incoming| &incoming.texture);
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
         let color_attachment = render_pass_descriptor
@@ -497,9 +536,11 @@ impl PageCurlResources {
         encoder.set_fragment_texture(bind::TEXTURE_CAPTURE, Some(&capture.texture));
         encoder.set_fragment_texture(bind::TEXTURE_SHADOW, Some(&shadow.color));
         encoder.set_fragment_texture(bind::TEXTURE_BACK, Some(&back_capture.texture));
+        encoder.set_fragment_texture(bind::TEXTURE_INCOMING, Some(incoming));
         encoder.set_fragment_sampler_state(bind::SAMPLER_CAPTURE, Some(&self.sampler));
         encoder.set_fragment_sampler_state(bind::SAMPLER_SHADOW, Some(&self.sampler));
         encoder.set_fragment_sampler_state(bind::SAMPLER_BACK, Some(&self.sampler));
+        encoder.set_fragment_sampler_state(bind::SAMPLER_INCOMING, Some(&self.sampler));
         encoder.draw_indexed_primitives(
             metal::MTLPrimitiveType::Triangle,
             u64::from(frame.index_count),
