@@ -481,7 +481,7 @@ impl PageCurlResources {
         encoder.set_vertex_bytes(
             bind::UNIFORMS,
             std::mem::size_of::<GpuCurlUniforms>() as u64,
-            std::ptr::addr_of!(uniforms).cast(),
+            std::ptr::from_ref(uniforms).cast(),
         );
         encoder.draw_indexed_primitives(
             metal::MTLPrimitiveType::Triangle,
@@ -572,7 +572,7 @@ impl PageCurlResources {
             encoder.set_vertex_bytes(
                 bind::UNIFORMS,
                 std::mem::size_of::<GpuCurlUniforms>() as u64,
-                std::ptr::addr_of!(uniforms).cast(),
+                std::ptr::from_ref(uniforms).cast(),
             );
             encoder.set_vertex_bytes(
                 bind::VIEWPORT,
@@ -582,7 +582,7 @@ impl PageCurlResources {
             encoder.set_fragment_bytes(
                 bind::UNIFORMS,
                 std::mem::size_of::<GpuCurlUniforms>() as u64,
-                std::ptr::addr_of!(uniforms).cast(),
+                std::ptr::from_ref(uniforms).cast(),
             );
             encoder.draw_indexed_primitives(
                 metal::MTLPrimitiveType::Triangle,

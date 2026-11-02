@@ -405,7 +405,12 @@ impl PageCurlResources {
             layout: &layouts.page_curl_uniforms,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
+                // 带 dynamic offset 的绑定只覆盖一槽：偏移量加绑定区间不能越过缓冲尾。
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &uniform_buffer,
+                    offset: 0,
+                    size: NonZeroU64::new(uniform_stride),
+                }),
             }],
         });
 
@@ -485,7 +490,12 @@ impl PageCurlResources {
                 layout: &layouts.page_curl_uniforms,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.uniform_buffer.as_entire_binding(),
+                    // 与初建时同一条规矩：绑定区间是一槽，偏移按槽距走。
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.uniform_buffer,
+                        offset: 0,
+                        size: NonZeroU64::new(self.uniform_stride),
+                    }),
                 }],
             });
         }
