@@ -99,15 +99,17 @@ pub(super) struct PageCurlResources {
     mesh_pipeline: metal::RenderPipelineState,
     shadow_pipeline: metal::RenderPipelineState,
     sampler: metal::SamplerState,
-    /// 本帧的 uniform：prepare 算好，两次 encode 各自用 set*Bytes 递给着色器。
-    frame_uniforms: Option<GpuCurlUniforms>,
+    /// 本帧的 uniform（**每张网格一份**）：prepare 算好，两次 encode 各自用
+    /// set*Bytes 递给着色器。一帧可以有两张网格（平移翻页的出场页 + 进场页），
+    /// 从前只留一份 uniform、一次 draw，第二张网格整帧不存在。
+    frame_uniforms: Vec<GpuCurlUniforms>,
     capture: Option<CaptureTexture>,
     back_capture: Option<CaptureTexture>,
     incoming_capture: Option<CaptureTexture>,
     depth: Option<DepthTexture>,
     shadow: Option<ShadowMap>,
     geometry: Option<GeometryCache>,
-    frame: Option<FrameDraw>,
+    frames: Vec<FrameDraw>,
 }
 
 struct CaptureTexture {
@@ -126,19 +128,32 @@ struct ShadowMap {
 }
 
 /// 卷曲网格的顶点/索引只由版心尺寸和网格分辨率决定，翻页进度只改 uniform。
+/// `key` 是拼接字节的内容指纹：指纹一样就复用缓冲（平移翻页两张平摊网格的
+/// 顶点逐字节相同 —— 都是页局部坐标的四角；卷曲网格按形状变化重建）。
 struct GeometryCache {
     vertex_buffer: metal::Buffer,
     index_buffer: metal::Buffer,
-    index_count: u32,
-    vertex_count: usize,
-    page_size: [f32; 2],
+    key: u64,
 }
 
 struct FrameDraw {
+    /// 这张网格在拼接后的索引缓冲里的起点（每张网格的索引是局部的，拼接时按
+    /// 前面各张的顶点数做了重排）。
+    index_start: u32,
     index_count: u32,
     /// 卷曲网格的页框（不是 canvas 的整块 content mask）：剪到版心，
     /// 避免卷起来那一截画到页眉/页脚上。
     page_bounds: Bounds<ScaledPixels>,
+}
+
+/// 顶点/索引拼接字节的内容指纹（FNV-1a）。
+fn geometry_key(vertex_bytes: &[u8], index_bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in vertex_bytes.iter().chain(index_bytes) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 /// 顶点/索引缓冲的存储模式：统一内存走 shared（CPU 写完 GPU 直见），
@@ -159,7 +174,8 @@ impl PageCurlResources {
     pub(super) fn new(
         device: &metal::Device,
         library: &metal::LibraryRef,
-        is_unified_memory: bool,
+        // 几何在 `prepare` 里建（那边才用得到统一/离散内存的判据），这里用不上。
+        _is_unified_memory: bool,
         target_format: metal::MTLPixelFormat,
     ) -> Self {
         let mesh_pipeline = Self::build_mesh_pipeline(device, library, target_format);
@@ -178,14 +194,14 @@ impl PageCurlResources {
             mesh_pipeline,
             shadow_pipeline,
             sampler,
-            frame_uniforms: None,
+            frame_uniforms: Vec::new(),
             capture: None,
             back_capture: None,
             incoming_capture: None,
             depth: None,
             shadow: None,
             geometry: None,
-            frame: None,
+            frames: Vec::new(),
         }
     }
 
@@ -246,10 +262,11 @@ impl PageCurlResources {
         self.incoming_capture = None;
         self.depth = None;
         self.geometry = None;
-        self.frame = None;
+        self.frames.clear();
+        self.frame_uniforms.clear();
     }
 
-    /// 从场景里取第一张网格，准备这一帧的顶点/索引缓冲与 uniform。
+    /// 从场景里取**全部**网格，准备这一帧的顶点/索引缓冲与 uniform（每张一份）。
     pub(super) fn prepare(
         &mut self,
         scene: &Scene,
@@ -257,26 +274,46 @@ impl PageCurlResources {
         is_unified_memory: bool,
         size: Size<DevicePixels>,
     ) {
-        let Some(mesh) = scene.page_curl_meshes.first() else {
-            self.frame = None;
+        let meshes = scene.page_curl_meshes.as_slice();
+        if meshes.is_empty() {
+            self.frames.clear();
+            self.frame_uniforms.clear();
             return;
-        };
-        let vertex_count = mesh.vertices.len();
-        let index_count = mesh.indices.len() as u32;
-        let cache_hit = self.geometry.as_ref().is_some_and(|geometry| {
-            geometry.page_size == mesh.uniforms.page_size
-                && geometry.index_count == index_count
-                && geometry.vertex_count == vertex_count
-        });
-        if !cache_hit {
+        }
+        // 顶点/索引逐张拼接（第二张起的索引按前面的顶点数重排）；内容指纹没变就
+        // 复用上一次的缓冲（卷曲网格逐帧形状不变，一个字节都不重传）。
+        let mut vertex_bytes = Vec::with_capacity(
+            meshes.iter().map(|m| std::mem::size_of_val(m.vertices.as_ref())).sum(),
+        );
+        let mut index_bytes = Vec::with_capacity(
+            meshes.iter().map(|m| std::mem::size_of_val(m.indices.as_ref())).sum(),
+        );
+        let mut frame_uniforms = Vec::with_capacity(meshes.len());
+        let mut frames = Vec::with_capacity(meshes.len());
+        let (mut vertex_base, mut index_base) = (0u32, 0u32);
+        for mesh in meshes {
+            vertex_bytes.extend_from_slice(bytemuck_bytes(mesh.vertices.as_ref()));
+            for index in mesh.indices.iter() {
+                index_bytes.extend_from_slice(&(index + vertex_base).to_ne_bytes());
+            }
+            let light_view_proj = light_view_proj(&mesh.uniforms);
+            frame_uniforms.push(GpuCurlUniforms::from_parts(&mesh.uniforms, light_view_proj));
+            frames.push(FrameDraw {
+                index_start: index_base,
+                index_count: mesh.indices.len() as u32,
+                page_bounds: mesh.bounds,
+            });
+            vertex_base += mesh.vertices.len() as u32;
+            index_base += mesh.indices.len() as u32;
+        }
+        let key = geometry_key(&vertex_bytes, &index_bytes);
+        if self.geometry.as_ref().is_none_or(|geometry| geometry.key != key) {
             let options = buffer_options(is_unified_memory);
-            let vertex_bytes = bytemuck_bytes(mesh.vertices.as_ref());
             let vertex_buffer = device.new_buffer_with_data(
                 vertex_bytes.as_ptr() as *const core::ffi::c_void,
                 vertex_bytes.len() as u64,
                 options,
             );
-            let index_bytes = bytemuck_bytes(mesh.indices.as_ref());
             let index_buffer = device.new_buffer_with_data(
                 index_bytes.as_ptr() as *const core::ffi::c_void,
                 index_bytes.len().max(4) as u64,
@@ -285,18 +322,12 @@ impl PageCurlResources {
             self.geometry = Some(GeometryCache {
                 vertex_buffer,
                 index_buffer,
-                index_count,
-                vertex_count,
-                page_size: mesh.uniforms.page_size,
+                key,
             });
         }
 
-        let light_view_proj = light_view_proj(&mesh.uniforms);
-        self.frame_uniforms = Some(GpuCurlUniforms::from_parts(&mesh.uniforms, light_view_proj));
-        self.frame = Some(FrameDraw {
-            index_count,
-            page_bounds: mesh.bounds,
-        });
+        self.frame_uniforms = frame_uniforms;
+        self.frames = frames;
 
         self.ensure_shadow(device);
         self.ensure_depth(device, size);
@@ -413,15 +444,19 @@ impl PageCurlResources {
     }
 
     /// 把网格从光源方向渲染进 shadow map。必须在主 pass 之前调用。
+    ///
+    /// 多网格帧（平移翻页的两张平摊网格）里 shadow map 的内容其实没人读 ——
+    /// 平摊分支在 shadow 采样之前就 return 了；这里把拼接后的整份几何画一遍，
+    /// 只是让那一趟有东西可画。
     pub(super) fn encode_shadow(&self, command_buffer: &metal::CommandBufferRef) {
         let (Some(frame), Some(geometry), Some(shadow)) = (
-            self.frame.as_ref(),
+            self.frames.first(),
             self.geometry.as_ref(),
             self.shadow.as_ref(),
         ) else {
             return;
         };
-        let Some(uniforms) = self.frame_uniforms else {
+        let Some(uniforms) = self.frame_uniforms.first() else {
             return;
         };
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
@@ -458,16 +493,18 @@ impl PageCurlResources {
         encoder.end_encoding();
     }
 
-    /// 画卷曲网格。`target` 是主颜色附件。
+    /// 画卷曲网格。`target` 是主颜色附件。**逐网格绘制**：每张先剪自己的页框、
+    /// 递自己的 uniform，再从拼接索引缓冲里取自己那一段（平移翻页的两张平摊
+    /// 网格各盖半屏，从前只画先入树的那一张，另一张整帧不存在）。
     pub(super) fn encode_mesh_pass(
         &self,
         command_buffer: &metal::CommandBufferRef,
         target: &metal::TextureRef,
         size: Size<DevicePixels>,
     ) {
-        let Some(frame) = self.frame.as_ref() else {
+        if self.frames.is_empty() {
             return;
-        };
+        }
         let Some(geometry) = self.geometry.as_ref() else {
             return;
         };
@@ -482,7 +519,7 @@ impl PageCurlResources {
         let Some(capture) = self.capture.as_ref() else {
             return;
         };
-        let Some(uniforms) = self.frame_uniforms else {
+        let Some(_first_uniforms) = self.frame_uniforms.first() else {
             return;
         };
         // 背面纹理是懒创建的（层 2 只在折页里请求）：纯平移会话从头到尾没有背面，
@@ -517,27 +554,7 @@ impl PageCurlResources {
 
         let encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
         encoder.set_render_pipeline_state(&self.mesh_pipeline);
-        // 剪到版心：卷起来那一截不该画到页眉/页脚上。
-        let scissor = scissor_rect(&frame.page_bounds, size);
-        if scissor.width > 0 && scissor.height > 0 {
-            encoder.set_scissor_rect(scissor);
-        }
         encoder.set_vertex_buffer(bind::VERTEX, Some(&geometry.vertex_buffer), 0);
-        encoder.set_vertex_bytes(
-            bind::UNIFORMS,
-            std::mem::size_of::<GpuCurlUniforms>() as u64,
-            std::ptr::addr_of!(uniforms).cast(),
-        );
-        encoder.set_vertex_bytes(
-            bind::VIEWPORT,
-            std::mem::size_of::<Size<DevicePixels>>() as u64,
-            std::ptr::addr_of!(size).cast(),
-        );
-        encoder.set_fragment_bytes(
-            bind::UNIFORMS,
-            std::mem::size_of::<GpuCurlUniforms>() as u64,
-            std::ptr::addr_of!(uniforms).cast(),
-        );
         encoder.set_fragment_texture(bind::TEXTURE_CAPTURE, Some(&capture.texture));
         encoder.set_fragment_texture(bind::TEXTURE_SHADOW, Some(&shadow.color));
         encoder.set_fragment_texture(bind::TEXTURE_BACK, Some(back));
@@ -546,13 +563,35 @@ impl PageCurlResources {
         encoder.set_fragment_sampler_state(bind::SAMPLER_SHADOW, Some(&self.sampler));
         encoder.set_fragment_sampler_state(bind::SAMPLER_BACK, Some(&self.sampler));
         encoder.set_fragment_sampler_state(bind::SAMPLER_INCOMING, Some(&self.sampler));
-        encoder.draw_indexed_primitives(
-            metal::MTLPrimitiveType::Triangle,
-            u64::from(frame.index_count),
-            metal::MTLIndexType::UInt32,
-            &geometry.index_buffer,
-            0,
-        );
+        for (frame, uniforms) in self.frames.iter().zip(&self.frame_uniforms) {
+            // 剪到版心：卷起来那一截不该画到页眉/页脚上；两张平摊网格各剪各的范围。
+            let scissor = scissor_rect(&frame.page_bounds, size);
+            if scissor.width > 0 && scissor.height > 0 {
+                encoder.set_scissor_rect(scissor);
+            }
+            encoder.set_vertex_bytes(
+                bind::UNIFORMS,
+                std::mem::size_of::<GpuCurlUniforms>() as u64,
+                std::ptr::addr_of!(uniforms).cast(),
+            );
+            encoder.set_vertex_bytes(
+                bind::VIEWPORT,
+                std::mem::size_of::<Size<DevicePixels>>() as u64,
+                std::ptr::addr_of!(size).cast(),
+            );
+            encoder.set_fragment_bytes(
+                bind::UNIFORMS,
+                std::mem::size_of::<GpuCurlUniforms>() as u64,
+                std::ptr::addr_of!(uniforms).cast(),
+            );
+            encoder.draw_indexed_primitives(
+                metal::MTLPrimitiveType::Triangle,
+                u64::from(frame.index_count),
+                metal::MTLIndexType::UInt32,
+                &geometry.index_buffer,
+                u64::from(frame.index_start) * 4,
+            );
+        }
         encoder.end_encoding();
     }
 }

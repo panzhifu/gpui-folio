@@ -109,7 +109,8 @@ pub(super) fn create_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroup
             visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
+                // 一帧多张网格共用这条 uniform 缓冲，绘制按槽距给 dynamic offset。
+                has_dynamic_offset: true,
                 min_binding_size: NonZeroU64::new(std::mem::size_of::<GpuCurlUniforms>() as u64),
             },
             count: None,
@@ -327,10 +328,16 @@ struct ShadowTexture {
 }
 
 struct FrameDraw {
+    /// 这张网格在**拼接后**的索引缓冲里的起点（每张网格的索引是局部的，拼接时
+    /// 按前面各张的顶点数做了重排）。
+    index_start: u32,
     index_count: u32,
     /// 卷曲网格的页框（不是 canvas 的整块 content mask）：剪到版心，
     /// 避免卷起来那一截画到页眉/页脚上。
     page_bounds: Bounds<ScaledPixels>,
+    /// uniform 缓冲里的动态偏移（按 `uniform_stride` 对齐）。一帧可以有多张网格
+    /// （平移翻页的出场页 + 进场页），每张各用各的一份 uniform。
+    uniform_offset: u32,
 }
 
 /// 页面网格的顶点/索引只由版心尺寸和网格分辨率决定，翻页进度只改 uniform。
@@ -339,14 +346,27 @@ struct GeometryCache {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
-    vertex_count: usize,
-    page_size: [f32; 2],
+}
+
+/// 拼接几何的内容指纹：顶点/索引字节一样才复用缓冲（平移翻页两张平摊网格的
+/// 顶点逐字节相同 —— 都是页局部坐标的四角；卷曲网格按形状变化重建）。
+fn geometry_key(vertex_bytes: &[u8], index_bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in vertex_bytes.iter().chain(index_bytes) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 pub(super) struct PageCurlResources {
     pipelines: PageCurlPipelines,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
+    /// uniform 槽距：`GpuCurlUniforms` 尺寸向上取到 `min_uniform_buffer_offset_alignment`
+    /// 的整数倍。一帧多张网格（平移翻页的出场页 + 进场页）各占一槽，绘制时按
+    /// dynamic offset 取。
+    uniform_stride: u64,
     sampler: wgpu::Sampler,
     capture: Option<CaptureTexture>,
     back_capture: Option<CaptureTexture>,
@@ -357,7 +377,8 @@ pub(super) struct PageCurlResources {
     depth: Option<DepthTexture>,
     shadow: Option<ShadowTexture>,
     geometry: Option<GeometryCache>,
-    frame: Option<FrameDraw>,
+    geometry_key: Option<u64>,
+    frames: Vec<FrameDraw>,
     target_format: wgpu::TextureFormat,
 }
 
@@ -368,9 +389,14 @@ impl PageCurlResources {
         pipelines: PageCurlPipelines,
         target_format: wgpu::TextureFormat,
     ) -> Self {
+        // uniform 一槽一条 `GpuCurlUniforms`，槽距按设备对齐要求向上取整；先给 4 槽，
+        // 装不下更多张网格时在 `prepare` 里按需扩容。
+        let align = device.limits().min_uniform_buffer_offset_alignment as u64;
+        let uniform_stride =
+            (std::mem::size_of::<GpuCurlUniforms>() as u64).div_ceil(align) * align;
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("page_curl_uniforms"),
-            size: std::mem::size_of::<GpuCurlUniforms>() as u64,
+            size: uniform_stride * 4,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -398,6 +424,7 @@ impl PageCurlResources {
             pipelines,
             uniform_buffer,
             uniform_bind_group,
+            uniform_stride,
             sampler,
             capture: None,
             back_capture: None,
@@ -406,7 +433,8 @@ impl PageCurlResources {
             depth: None,
             shadow: None,
             geometry: None,
-            frame: None,
+            geometry_key: None,
+            frames: Vec::new(),
             target_format,
         }
     }
@@ -418,10 +446,17 @@ impl PageCurlResources {
         self.capture_pair_bind_group = None;
         self.depth = None;
         self.geometry = None;
-        self.frame = None;
+        self.geometry_key = None;
+        self.frames.clear();
     }
 
-    /// 从场景里取第一张网格，准备这一帧的顶点/索引缓冲与 uniform。
+    /// 从场景里取**全部**网格，准备这一帧的顶点/索引缓冲与 uniform。
+    ///
+    /// 一帧可以有两张网格（平移翻页的出场页 + 进场页），从前这里只取 `first()`：
+    /// 一份 uniform、一次 draw —— 第二张网格整帧不存在，主场景里它那一页又已经
+    /// 让给了网格，屏上就是半屏白（2026-11-02 真机）。顶点/索引按帧拼接成一条
+    /// 缓冲（各张网格的索引按前面顶点数重排），uniform 每张占一槽，绘制时按
+    /// dynamic offset 取。拼接内容做了指纹缓存：卷曲网格逐帧不变时一个字节都不重传。
     pub(super) fn prepare(
         &mut self,
         scene: &Scene,
@@ -430,53 +465,109 @@ impl PageCurlResources {
         layouts: &WgpuBindGroupLayouts,
         size: Size<DevicePixels>,
     ) -> Result<()> {
-        let Some(mesh) = scene.page_curl_meshes.first() else {
-            self.frame = None;
+        let meshes = scene.page_curl_meshes.as_slice();
+        if meshes.is_empty() {
+            self.frames.clear();
             return Ok(());
-        };
-        let vertex_count = mesh.vertices.len();
-        let index_count = mesh.indices.len() as u32;
-        let cache_hit = self.geometry.as_ref().is_some_and(|geometry| {
-            geometry.page_size == mesh.uniforms.page_size
-                && geometry.vertex_count == vertex_count
-                && geometry.index_count == index_count
-        });
+        }
+        // uniform：每张网格一槽；槽位不够时扩容缓冲并重建 bind group（罕见：
+        // 一帧就一两张，4 槽的初值基本够用）。
+        let need = self.uniform_stride * meshes.len() as u64;
+        if self.uniform_buffer.size() < need {
+            self.uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("page_curl_uniforms"),
+                size: need,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("page_curl_uniforms_bind_group"),
+                layout: &layouts.page_curl_uniforms,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                }],
+            });
+        }
+        for (i, mesh) in meshes.iter().enumerate() {
+            let light_view_proj = light_view_proj(&mesh.uniforms);
+            let uniforms = GpuCurlUniforms::from_parts(&mesh.uniforms, light_view_proj);
+            queue.write_buffer(
+                &self.uniform_buffer,
+                self.uniform_stride * i as u64,
+                bytemuck::bytes_of(&uniforms),
+            );
+        }
+
+        // 顶点/索引：逐张拼接，第二张起的索引按前面的顶点数重排；内容指纹没变就
+        // 复用上一次的缓冲（卷曲网格逐帧形状不变，一个字节都不重传）。
+        let mut vertex_bytes = Vec::with_capacity(
+            meshes.iter().map(|m| m.vertices.len() * 16).sum::<usize>(),
+        );
+        let mut index_bytes = Vec::with_capacity(
+            meshes.iter().map(|m| m.indices.len() * 4).sum::<usize>(),
+        );
+        let mut frames = Vec::with_capacity(meshes.len());
+        let (mut vertex_base, mut index_base) = (0u32, 0u32);
+        for (i, mesh) in meshes.iter().enumerate() {
+            vertex_bytes.extend_from_slice(bytemuck::cast_slice(mesh.vertices.as_ref()));
+            for index in mesh.indices.iter() {
+                index_bytes.extend_from_slice(&(index + vertex_base).to_ne_bytes());
+            }
+            frames.push(FrameDraw {
+                index_start: index_base,
+                index_count: mesh.indices.len() as u32,
+                page_bounds: mesh.bounds,
+                uniform_offset: (self.uniform_stride * i as u64) as u32,
+            });
+            vertex_base += mesh.vertices.len() as u32;
+            index_base += mesh.indices.len() as u32;
+        }
+        let key = geometry_key(&vertex_bytes, &index_bytes);
+        let cache_hit = self.geometry_key == Some(key);
         if !cache_hit {
-            let vertex_bytes = bytemuck::cast_slice(mesh.vertices.as_ref());
-            let index_bytes = bytemuck::cast_slice(mesh.indices.as_ref());
-            let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("page_curl_vertices"),
-                size: vertex_bytes.len().max(1) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            queue.write_buffer(&vertex_buffer, 0, vertex_bytes);
-
-            let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("page_curl_indices"),
-                size: index_bytes.len().max(4) as u64,
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            queue.write_buffer(&index_buffer, 0, index_bytes);
-
+            let vertex_capacity = self
+                .geometry
+                .as_ref()
+                .map_or(0, |g| g.vertex_buffer.size());
+            let index_capacity = self.geometry.as_ref().map_or(0, |g| g.index_buffer.size());
+            let vertex_buffer = if vertex_capacity >= vertex_bytes.len() as u64 {
+                let buffer = self.geometry.as_ref().unwrap().vertex_buffer.clone();
+                queue.write_buffer(&buffer, 0, &vertex_bytes);
+                buffer
+            } else {
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("page_curl_vertices"),
+                    size: vertex_bytes.len() as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                queue.write_buffer(&buffer, 0, &vertex_bytes);
+                buffer
+            };
+            let index_buffer = if index_capacity >= index_bytes.len() as u64 {
+                let buffer = self.geometry.as_ref().unwrap().index_buffer.clone();
+                queue.write_buffer(&buffer, 0, &index_bytes);
+                buffer
+            } else {
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("page_curl_indices"),
+                    size: index_bytes.len().max(4) as u64,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                queue.write_buffer(&buffer, 0, &index_bytes);
+                buffer
+            };
             self.geometry = Some(GeometryCache {
                 vertex_buffer,
                 index_buffer,
-                index_count,
-                vertex_count,
-                page_size: mesh.uniforms.page_size,
+                index_count: index_base,
             });
+            self.geometry_key = Some(key);
         }
 
-        let light_view_proj = light_view_proj(&mesh.uniforms);
-        let uniforms = GpuCurlUniforms::from_parts(&mesh.uniforms, light_view_proj);
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
-
-        self.frame = Some(FrameDraw {
-            index_count,
-            page_bounds: mesh.bounds,
-        });
+        self.frames = frames;
 
         self.ensure_shadow(device, layouts);
         self.ensure_depth(device, size);
@@ -541,13 +632,17 @@ impl PageCurlResources {
     }
 
     /// 把网格从光源方向渲染进 shadow map。必须在主 pass 之前调用。
+    ///
+    /// 多网格帧（平移翻页的两张平摊网格）里 shadow map 的内容其实没人读 ——
+    /// 平摊分支在 shadow 采样之前就 return 了；这里把拼接后的整份几何画一遍，
+    /// 只是让那一趟有东西可画。
     pub(super) fn encode_shadow(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         globals_bind_group: &wgpu::BindGroup,
     ) {
         let (Some(_frame), Some(geometry), Some(shadow)) = (
-            self.frame.as_ref(),
+            self.frames.first(),
             self.geometry.as_ref(),
             self.shadow.as_ref(),
         ) else {
@@ -577,7 +672,7 @@ impl PageCurlResources {
         });
         pass.set_pipeline(&self.pipelines.shadow);
         pass.set_bind_group(0, globals_bind_group, &[]);
-        pass.set_bind_group(1, &self.uniform_bind_group, &[]);
+        pass.set_bind_group(1, &self.uniform_bind_group, &[0]);
         pass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
         pass.set_index_buffer(geometry.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..geometry.index_count, 0, 0..1);
@@ -788,7 +883,9 @@ impl PageCurlResources {
         });
     }
 
-    /// 画卷曲网格。`target` 是主颜色附件。
+    /// 画卷曲网格。`target` 是主颜色附件。**逐网格绘制**：`prepare` 为每张网格备好
+    /// 自己的 uniform 槽与拼接索引段，这里按张循环 —— 每张先剪自己的页框再画
+    /// （平移翻页的两张平摊网格各盖半屏，各自剪各自的范围；页码沿拼接缓冲推进）。
     pub(super) fn encode_mesh_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -796,9 +893,9 @@ impl PageCurlResources {
         size: Size<DevicePixels>,
         globals_bind_group: &wgpu::BindGroup,
     ) {
-        let Some(frame) = self.frame.as_ref() else {
+        if self.frames.is_empty() {
             return;
-        };
+        }
         let Some(geometry) = self.geometry.as_ref() else {
             return;
         };
@@ -810,24 +907,12 @@ impl PageCurlResources {
         // 或者翻页赶在烘纹理之前，整片纸就读成黑。跳过只是「这一趟没卷起来」—— 下面那张页本来
         // 就在那儿，读起来是一次普通的落定；绑黑读起来是屏幕上一条黑带。
         //
-        // 合组那张 bind group 只在**两张**捕获纹理都到位时才建得出来（见
-        // `refresh_capture_pair`），缺它就是某一半还没烘出来，与缺单张同一条退路。
+        // 背面与进场两格允许用正面占位（见 `refresh_capture_pair`），所以这一格在
+        // 正面烘过一次之后恒 Some。
         let Some(capture_pair) = self.capture_pair_bind_group.as_ref() else {
             log::debug!("page_curl: 缺捕获纹理，这一帧不画卷曲网格");
             return;
         };
-
-        let b = frame.page_bounds;
-        let x = b.origin.x.0.max(0.0) as u32;
-        let y = b.origin.y.0.max(0.0) as u32;
-        let right = (b.origin.x.0 + b.size.width.0)
-            .min(size.width.0 as f32)
-            .max(0.0) as u32;
-        let bottom = (b.origin.y.0 + b.size.height.0)
-            .min(size.height.0 as f32)
-            .max(0.0) as u32;
-        let width = right.saturating_sub(x);
-        let height = bottom.saturating_sub(y);
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("page_curl_mesh_pass"),
@@ -852,9 +937,6 @@ impl PageCurlResources {
             }),
             ..Default::default()
         });
-        if width > 0 && height > 0 {
-            pass.set_scissor_rect(x, y, width, height);
-        }
 
         // shadow map 在 `encode_shadow` 那一趟里已经烘好；这里只画卷面，片元自己采样
         // 投影（平摊段也按同一张图压暗），不再有第二张「假投影网格」。
@@ -864,12 +946,33 @@ impl PageCurlResources {
         };
         pass.set_pipeline(&self.pipelines.mesh);
         pass.set_bind_group(0, globals_bind_group, &[]);
-        pass.set_bind_group(1, &self.uniform_bind_group, &[]);
         pass.set_bind_group(2, capture_pair, &[]);
         pass.set_bind_group(3, &shadow.bind_group, &[]);
         pass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
         pass.set_index_buffer(geometry.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..frame.index_count, 0, 0..1);
+        for frame in &self.frames {
+            let b = frame.page_bounds;
+            let x = b.origin.x.0.max(0.0) as u32;
+            let y = b.origin.y.0.max(0.0) as u32;
+            let right = (b.origin.x.0 + b.size.width.0)
+                .min(size.width.0 as f32)
+                .max(0.0) as u32;
+            let bottom = (b.origin.y.0 + b.size.height.0)
+                .min(size.height.0 as f32)
+                .max(0.0) as u32;
+            let width = right.saturating_sub(x);
+            let height = bottom.saturating_sub(y);
+            if width == 0 || height == 0 {
+                continue;
+            }
+            pass.set_scissor_rect(x, y, width, height);
+            pass.set_bind_group(1, &self.uniform_bind_group, &[frame.uniform_offset]);
+            pass.draw_indexed(
+                frame.index_start..frame.index_start + frame.index_count,
+                0,
+                0..1,
+            );
+        }
     }
 }
 

@@ -2283,9 +2283,8 @@ struct PageCurlResources {
     mesh_ps: ID3D11PixelShader,
     shadow_vs: ID3D11VertexShader,
     shadow_ps: ID3D11PixelShader,
-    /// b2：卷曲 uniform（240 字节，DYNAMIC，每帧 update_buffer）。
-    uniform_buffer: ID3D11Buffer,
-    /// b3：视口（16 字节对齐格）。
+    /// b3：视口（16 字节对齐格）。卷曲 uniform 改成了每张网格一条
+    /// （见 `frames`），不再有共享的那一条。
     viewport_buffer: ID3D11Buffer,
     sampler: ID3D11SamplerState,
     depth_state: ID3D11DepthStencilState,
@@ -2295,8 +2294,10 @@ struct PageCurlResources {
     depth: Option<(ID3D11Texture2D, ID3D11DepthStencilView, Size<DevicePixels>)>,
     shadow: Option<PageCurlShadowMap>,
     geometry: Option<PageCurlGeometry>,
-    frame_uniforms: Option<GpuCurlUniforms>,
-    frame: Option<PageCurlFrame>,
+    /// 本帧的 uniform 与绘制段，**每张网格一份**。一帧可以有两张网格（平移翻页的
+    /// 出场页 + 进场页），从前只留一份 uniform、一次 DrawIndexed，第二张网格整帧
+    /// 不存在（2026-11-02 真机：左右平移半屏白）。
+    frames: Vec<PageCurlFrame>,
 }
 
 struct PageCurlCapture {
@@ -2318,12 +2319,28 @@ struct PageCurlGeometry {
     vertices_srv: ID3D11ShaderResourceView,
     indices: ID3D11Buffer,
     index_count: u32,
-    page_size: [f32; 2],
+    key: u64,
 }
 
 struct PageCurlFrame {
+    /// 这张网格在拼接后的索引缓冲里的起点（每张网格的索引是局部的，拼接时按
+    /// 前面各张的顶点数做了重排）。
+    index_start: u32,
     index_count: u32,
-    page_bounds: Bounds<ScaledPixels>,
+    /// 这张网格自己的常量缓冲（内容逐帧变，DEFAULT + update_buffer）。D3D11 的
+    /// 常量缓冲按条给（不像 wgpu/Metal 能给偏移），所以每张网格一条。
+    uniform_buffer: ID3D11Buffer,
+}
+
+/// 顶点/索引拼接字节的内容指纹（FNV-1a）：指纹一样就复用 IMMUTABLE 缓冲
+/// （平移翻页两张平摊网格的顶点逐字节相同 —— 都是页局部坐标的四角）。
+fn page_curl_geometry_key(vertex_bytes: &[u8], index_bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in vertex_bytes.iter().chain(index_bytes) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 impl PageCurlResources {
@@ -2344,7 +2361,6 @@ impl PageCurlResources {
             device,
             RawShaderBytes::new(ShaderModule::PageCurlShadow, ShaderTarget::Fragment)?.as_bytes(),
         )?;
-        let uniform_buffer = create_constant_buffer::<GpuCurlUniforms>(device)?;
         let viewport_buffer = create_constant_buffer::<[f32; 4]>(device)?;
 
         let sampler = unsafe {
@@ -2384,7 +2400,6 @@ impl PageCurlResources {
             mesh_ps,
             shadow_vs,
             shadow_ps,
-            uniform_buffer: uniform_buffer.unwrap(),
             viewport_buffer: viewport_buffer.unwrap(),
             sampler: sampler.unwrap(),
             depth_state: depth_state.unwrap(),
@@ -2394,8 +2409,7 @@ impl PageCurlResources {
             depth: None,
             shadow: None,
             geometry: None,
-            frame_uniforms: None,
-            frame: None,
+            frames: Vec::new(),
         })
     }
 
@@ -2406,34 +2420,59 @@ impl PageCurlResources {
         self.depth = None;
         self.shadow = None;
         self.geometry = None;
-        self.frame = None;
-        self.frame_uniforms = None;
+        self.frames.clear();
     }
 
-    /// 从场景里取第一张网格，上传顶点/索引/uniform。几何按 (page_size, 索引数)
-    /// 缓存：翻页进度只改 uniform，网格本身不变。
+    /// 从场景里取**全部**网格，上传顶点/索引/uniform。几何按拼接内容的指纹缓存：
+    /// 翻页进度只改 uniform，网格本身不变。
     pub(crate) fn prepare(
         &mut self,
         device: &ID3D11Device,
         device_context: &ID3D11DeviceContext,
         scene: &Scene,
     ) -> Result<()> {
-        let Some(mesh) = scene.page_curl_meshes.first() else {
-            self.frame = None;
+        let meshes = scene.page_curl_meshes.as_slice();
+        if meshes.is_empty() {
+            self.frames.clear();
             return Ok(());
-        };
-        let cache_hit = self
-            .geometry
-            .as_ref()
-            .is_some_and(|geometry| geometry.page_size == mesh.uniforms.page_size);
-        if !cache_hit {
-            // IMMUTABLE + 创建时给数据：动画期间网格不变，换页框才重建。
-            let vertex_data = unsafe {
+        }
+        // 顶点/索引逐张拼接（第二张起的索引按前面的顶点数重排）；内容指纹没变就
+        // 复用上一次的 IMMUTABLE 缓冲（卷曲网格逐帧形状不变）。
+        let mut vertex_bytes = Vec::with_capacity(
+            meshes.iter().map(|m| std::mem::size_of_val(m.vertices.as_ref())).sum(),
+        );
+        let mut index_bytes = Vec::with_capacity(
+            meshes.iter().map(|m| std::mem::size_of_val(m.indices.as_ref())).sum(),
+        );
+        let mut frames = Vec::with_capacity(meshes.len());
+        let (mut vertex_base, mut index_base) = (0u32, 0u32);
+        for mesh in meshes {
+            vertex_bytes.extend_from_slice(unsafe {
                 std::slice::from_raw_parts(
                     mesh.vertices.as_ptr() as *const u8,
                     std::mem::size_of_val(mesh.vertices.as_ref()),
                 )
-            };
+            });
+            for index in mesh.indices.iter() {
+                index_bytes.extend_from_slice(&(index + vertex_base).to_ne_bytes());
+            }
+            let light_view_proj = page_curl_light_view_proj(&mesh.uniforms);
+            let uniforms = GpuCurlUniforms::from_parts(&mesh.uniforms, light_view_proj);
+            let uniform_buffer = create_constant_buffer::<GpuCurlUniforms>(device)?.unwrap();
+            update_buffer(device_context, &uniform_buffer, &[uniforms])?;
+            frames.push(PageCurlFrame {
+                index_start: index_base,
+                index_count: mesh.indices.len() as u32,
+                uniform_buffer,
+            });
+            vertex_base += mesh.vertices.len() as u32;
+            index_base += mesh.indices.len() as u32;
+        }
+        let key = page_curl_geometry_key(&vertex_bytes, &index_bytes);
+        let cache_hit = self.geometry.as_ref().is_some_and(|geometry| geometry.key == key);
+        if !cache_hit {
+            // IMMUTABLE + 创建时给数据：动画期间网格不变，换页框/换形状才重建。
+            let vertex_data = vertex_bytes;
             let vertices = {
                 let desc = D3D11_BUFFER_DESC {
                     ByteWidth: vertex_data.len() as u32,
@@ -2463,7 +2502,7 @@ impl PageCurlResources {
                             Buffer: D3D11_BUFFER_SRV {
                                 Anonymous1: D3D11_BUFFER_SRV_0 { FirstElement: 0 },
                                 Anonymous2: D3D11_BUFFER_SRV_1 {
-                                    NumElements: mesh.vertices.len() as u32,
+                                    NumElements: vertex_base as u32,
                                 },
                             },
                         },
@@ -2472,12 +2511,7 @@ impl PageCurlResources {
                 )?;
             }
 
-            let index_data = unsafe {
-                std::slice::from_raw_parts(
-                    mesh.indices.as_ptr() as *const u8,
-                    std::mem::size_of_val(mesh.indices.as_ref()),
-                )
-            };
+            let index_data = index_bytes;
             let indices = {
                 let desc = D3D11_BUFFER_DESC {
                     ByteWidth: index_data.len() as u32,
@@ -2501,18 +2535,12 @@ impl PageCurlResources {
                 vertices,
                 vertices_srv: srv.unwrap(),
                 indices,
-                index_count: mesh.indices.len() as u32,
-                page_size: mesh.uniforms.page_size,
+                index_count: index_base,
+                key,
             });
         }
 
-        let light_view_proj = page_curl_light_view_proj(&mesh.uniforms);
-        self.frame_uniforms = Some(GpuCurlUniforms::from_parts(&mesh.uniforms, light_view_proj));
-        self.frame = Some(PageCurlFrame {
-            index_count: mesh.indices.len() as u32,
-            page_bounds: mesh.bounds,
-        });
-        let _ = device_context;
+        self.frames = frames;
         Ok(())
     }
 
@@ -2610,16 +2638,18 @@ impl PageCurlResources {
     }
 
     /// 把网格从光源方向渲染进 shadow map。必须在捕获与主 pass 之前调用。
+    ///
+    /// 多网格帧（平移翻页的两张平摊网格）里 shadow map 的内容其实没人读 ——
+    /// 平摊分支在 shadow 采样之前就 return 了；这里把拼接后的整份几何画一遍
+    /// （uniform 取第一张），只是让那一趟有东西可画。
     pub(crate) fn encode_shadow(&mut self, device_context: &ID3D11DeviceContext) -> Result<()> {
-        let (Some(_frame), Some(geometry), Some(shadow), Some(uniforms)) = (
-            self.frame.as_ref(),
+        let (Some(frame), Some(geometry), Some(shadow)) = (
+            self.frames.first(),
             self.geometry.as_ref(),
             self.shadow.as_ref(),
-            self.frame_uniforms,
         ) else {
             return Ok(());
         };
-        update_buffer(device_context, &self.uniform_buffer, &[uniforms])?;
         unsafe {
             device_context.OMSetRenderTargets(
                 Some(&[Some(shadow.color_rtv.clone())][..]),
@@ -2642,7 +2672,8 @@ impl PageCurlResources {
             device_context.PSSetShader(&self.shadow_ps, None);
             device_context
                 .VSSetShaderResources(1, Some(&[Some(geometry.vertices_srv.clone())][..]));
-            device_context.VSSetConstantBuffers(2, Some(&[Some(self.uniform_buffer.clone())][..]));
+            device_context
+                .VSSetConstantBuffers(2, Some(&[Some(frame.uniform_buffer.clone())][..]));
             device_context.DrawIndexed(geometry.index_count as u32, 0, 0);
         }
         Ok(())
@@ -2657,13 +2688,15 @@ impl PageCurlResources {
         main_rtv: &ID3D11RenderTargetView,
         size: Size<DevicePixels>,
     ) -> Result<()> {
-        let (Some(frame), Some(geometry), Some((_, depth_dsv, _))) = (
-            self.frame.as_ref(),
+        let (Some(geometry), Some((_, depth_dsv, _))) = (
             self.geometry.as_ref(),
             self.depth.as_ref(),
         ) else {
             return Ok(());
         };
+        if self.frames.is_empty() {
+            return Ok(());
+        }
         let Some(capture) = self.capture.as_ref() else {
             // 没有捕获纹理就不画：母本注释里那条「绑黑纹理 = 屏上一条黑带」。
             return Ok(());
@@ -2682,10 +2715,6 @@ impl PageCurlResources {
             .incoming_capture
             .as_ref()
             .map_or(&capture.srv, |incoming| &incoming.srv);
-        let Some(uniforms) = self.frame_uniforms else {
-            return Ok(());
-        };
-        update_buffer(device_context, &self.uniform_buffer, &[uniforms])?;
         update_buffer(
             device_context,
             &self.viewport_buffer,
@@ -2703,14 +2732,19 @@ impl PageCurlResources {
             device_context.PSSetShader(&self.mesh_ps, None);
             device_context
                 .VSSetShaderResources(1, Some(&[Some(geometry.vertices_srv.clone())][..]));
-            device_context.VSSetConstantBuffers(2, Some(&[Some(self.uniform_buffer.clone())][..]));
             device_context.VSSetConstantBuffers(3, Some(&[Some(self.viewport_buffer.clone())][..]));
-            device_context.PSSetConstantBuffers(2, Some(&[Some(self.uniform_buffer.clone())][..]));
             device_context.PSSetShaderResources(2, Some(&[Some(capture.srv.clone())][..]));
             device_context.PSSetShaderResources(4, Some(&[Some(back.clone())][..]));
             device_context.PSSetShaderResources(5, Some(&[Some(incoming.clone())][..]));
             device_context.PSSetSamplers(1, Some(&[Some(self.sampler.clone())][..]));
-            device_context.DrawIndexed(frame.index_count as u32, 0, 0);
+            // 逐网格：每张自己的常量缓冲（b2）与拼接索引里自己的那一段。
+            for frame in &self.frames {
+                device_context
+                    .VSSetConstantBuffers(2, Some(&[Some(frame.uniform_buffer.clone())][..]));
+                device_context
+                    .PSSetConstantBuffers(2, Some(&[Some(frame.uniform_buffer.clone())][..]));
+                device_context.DrawIndexed(frame.index_count as u32, frame.index_start, 0);
+            }
             // 深度解绑恢复：主 pass 其余批次没有深度语义。
             device_context.OMSetRenderTargets(Some(&[Some(main_rtv.clone())][..]), None);
             device_context.OMSetDepthStencilState(None, 0);
