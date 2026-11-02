@@ -708,14 +708,23 @@ impl PageCurlResources {
 
     /// 正面、背面与进场页三张捕获纹理并成一张 bind group（group 2 的六个绑定）。
     ///
-    /// 在任一张捕获纹理（重）建之后调：正面与背面到位才建得出来，所以第一帧只建出
-    /// 正面那一半时先欠着，背面到位的那次调用把它补上；进场页纹理是懒创建的，还没建
-    /// 时第三格先用正面的 view 占位。谁重建纹理谁就得重建这张组 —— 旧的 view 一 drop，
-    /// 组里攥着的引用就悬了。尺寸没变时一个字节都不动。
+    /// 在任一张捕获纹理（重）建之后调。**背面与进场两格都允许占位**：这两张纹理是
+    /// 懒创建的（层 2 只在折页里请求、层 3 只在平摊翻页第一次烘进场页时请求），而
+    /// 纯平移会话从头到尾没有背面 —— 从前这里缺背面就整组不建，网格 pass 随之整趟
+    /// 跳过，平移翻页的两张平摊网格就一张都画不出来，主场景里两页又都让给了网格
+    /// （2026-11-02 真机：左右平移整屏白，只剩读数带）。占位安全的原因：着色器里
+    /// 背面透墨与进场采样两个分支，平摊网格在 `past <= -w` 提前 return 走不到背面
+    /// 那段、进场分支只在 `incoming = 1` 的网格上生效；卷曲网格落笔之前背面纹理必
+    /// 已随层 2 的捕获建好并把本组重建一遍。谁重建纹理谁就得重建这张组 —— 旧的
+    /// view 一 drop，组里攥着的引用就悬了。尺寸没变时一个字节都不动。
     fn refresh_capture_pair(&mut self, device: &wgpu::Device) {
-        let (Some(capture), Some(back)) = (&self.capture, &self.back_capture) else {
+        let Some(capture) = self.capture.as_ref() else {
             return;
         };
+        let back = self
+            .back_capture
+            .as_ref()
+            .map_or(&capture.view, |back| &back.view);
         let incoming = self
             .incoming_capture
             .as_ref()
@@ -734,7 +743,7 @@ impl PageCurlResources {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&back.view),
+                    resource: wgpu::BindingResource::TextureView(back),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,

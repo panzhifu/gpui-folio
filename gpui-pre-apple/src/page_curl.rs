@@ -482,12 +482,17 @@ impl PageCurlResources {
         let Some(capture) = self.capture.as_ref() else {
             return;
         };
-        let Some(back_capture) = self.back_capture.as_ref() else {
-            return;
-        };
         let Some(uniforms) = self.frame_uniforms else {
             return;
         };
+        // 背面纹理是懒创建的（层 2 只在折页里请求）：纯平移会话从头到尾没有背面，
+        // 缺着它整趟跳过的话，平移翻页的两张平摊网格一张都画不出来（2026-11-02
+        // 真机：左右平移整屏白）。先绑正面占位 —— 背面透墨分支只有卷曲网格走到，
+        // 而卷曲网格落笔之前背面必已随层 2 的捕获就位。
+        let back = self
+            .back_capture
+            .as_ref()
+            .map_or(&capture.texture, |back| &back.texture);
         // 进场页纹理是懒创建的：还没请求过进场页捕获时先绑正面，着色器只在
         // `incoming = 1` 的平摊网格上采它，那种网格出现时这张纹理已经建好了。
         let incoming = self
@@ -535,7 +540,7 @@ impl PageCurlResources {
         );
         encoder.set_fragment_texture(bind::TEXTURE_CAPTURE, Some(&capture.texture));
         encoder.set_fragment_texture(bind::TEXTURE_SHADOW, Some(&shadow.color));
-        encoder.set_fragment_texture(bind::TEXTURE_BACK, Some(&back_capture.texture));
+        encoder.set_fragment_texture(bind::TEXTURE_BACK, Some(back));
         encoder.set_fragment_texture(bind::TEXTURE_INCOMING, Some(incoming));
         encoder.set_fragment_sampler_state(bind::SAMPLER_CAPTURE, Some(&self.sampler));
         encoder.set_fragment_sampler_state(bind::SAMPLER_SHADOW, Some(&self.sampler));

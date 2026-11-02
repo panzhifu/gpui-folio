@@ -2668,9 +2668,14 @@ impl PageCurlResources {
             // 没有捕获纹理就不画：母本注释里那条「绑黑纹理 = 屏上一条黑带」。
             return Ok(());
         };
-        let Some(back_capture) = self.back_capture.as_ref() else {
-            return Ok(());
-        };
+        // 背面纹理是懒创建的（层 2 只在折页里请求）：纯平移会话从头到尾没有背面，
+        // 缺着它整趟跳过的话，平移翻页的两张平摊网格一张都画不出来（2026-11-02
+        // 真机：左右平移整屏白）。先绑正面占位 —— 背面透墨分支只有卷曲网格走到，
+        // 而卷曲网格落笔之前背面必已随层 2 的捕获就位。
+        let back = self
+            .back_capture
+            .as_ref()
+            .map_or(&capture.srv, |back| &back.srv);
         // 进场页纹理是懒创建的：还没请求过时先绑正面，着色器只在 `incoming = 1`
         // 的平摊网格上采它，那种网格出现时这张纹理已经建好了。
         let incoming = self
@@ -2702,7 +2707,7 @@ impl PageCurlResources {
             device_context.VSSetConstantBuffers(3, Some(&[Some(self.viewport_buffer.clone())][..]));
             device_context.PSSetConstantBuffers(2, Some(&[Some(self.uniform_buffer.clone())][..]));
             device_context.PSSetShaderResources(2, Some(&[Some(capture.srv.clone())][..]));
-            device_context.PSSetShaderResources(4, Some(&[Some(back_capture.srv.clone())][..]));
+            device_context.PSSetShaderResources(4, Some(&[Some(back.clone())][..]));
             device_context.PSSetShaderResources(5, Some(&[Some(incoming.clone())][..]));
             device_context.PSSetSamplers(1, Some(&[Some(self.sampler.clone())][..]));
             device_context.DrawIndexed(frame.index_count as u32, 0, 0);
