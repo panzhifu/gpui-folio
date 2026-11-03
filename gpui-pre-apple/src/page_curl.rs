@@ -7,6 +7,52 @@
 //!   - 着色器在 `shaders.metal` 里（MSL 直译 WGSL 母本），随 metallib 一起编。
 
 use gpui::{Bounds, DevicePixels, PageCurlUniforms, Scene, Size, ScaledPixels};
+use metal::foreign_types::{ForeignType, ForeignTypeRef};
+use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2_metal::{MTLCommandBuffer, MTLDevice, MTLLibrary, MTLTexture};
+use std::mem::ManuallyDrop;
+
+/// 0.3.11 的渲染器改用 objc2-metal 的绑定，而这份 page-curl 资源与编码代码是按
+/// `metal` crate 写的。两者包的是同一个 ObjC 对象，因此只在边界上互转，几何 /
+/// uniform / 编码三套逻辑保持原样。借用不 retain：调用方持有的对象都比这一次
+/// 绘制活得久。
+fn device_ref(device: &ProtocolObject<dyn MTLDevice>) -> ManuallyDrop<metal::Device> {
+    let any: &AnyObject = device.as_ref();
+    // SAFETY: `ProtocolObject<dyn MTLDevice>` 与 `metal::MTLDevice` 是同一个
+    // `id<MTLDevice>`；`ManuallyDrop` 保证这里不会多一次 release。
+    unsafe { ManuallyDrop::new(metal::Device::from_ptr(any as *const AnyObject as *mut _)) }
+}
+
+fn library_ref(library: &ProtocolObject<dyn MTLLibrary>) -> &metal::LibraryRef {
+    let any: &AnyObject = library.as_ref();
+    // SAFETY: 同一个 `id<MTLLibrary>`，借用期限不超过调用方。
+    unsafe { metal::LibraryRef::from_ptr(any as *const AnyObject as *mut _) }
+}
+
+fn command_buffer_ref(
+    command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+) -> &metal::CommandBufferRef {
+    let any: &AnyObject = command_buffer.as_ref();
+    // SAFETY: 同一个 `id<MTLCommandBuffer>`。
+    unsafe { metal::CommandBufferRef::from_ptr(any as *const AnyObject as *mut _) }
+}
+
+fn texture_ref(texture: &ProtocolObject<dyn MTLTexture>) -> &metal::TextureRef {
+    let any: &AnyObject = texture.as_ref();
+    // SAFETY: 同一个 `id<MTLTexture>`。
+    unsafe { metal::TextureRef::from_ptr(any as *const AnyObject as *mut _) }
+}
+
+/// 把内部建的捕获纹理借给渲染器的 objc2 编码器。
+pub(super) fn as_objc_texture(texture: &metal::Texture) -> &ProtocolObject<dyn MTLTexture> {
+    // SAFETY: `metal::Texture` 包的是 `id<MTLTexture>`，而 `ProtocolObject` 与
+    // `AnyObject` 是同布局的薄指针；这个对象本身就是我们建出来的 MTLTexture，
+    // 借用期限跟着 `texture`。
+    unsafe {
+        let object: *mut AnyObject = texture.as_ptr().cast();
+        &*(object as *const ProtocolObject<dyn MTLTexture>)
+    }
+}
 
 /// 与 `shaders.metal` 里 `CurlGpuUniforms` 一一对上（240 字节）。尺寸与三格关键
 /// 偏移都要一致：错一位不报错，只是阴影矩阵与两张捕获纹理的采样原点各读到隔壁
@@ -172,14 +218,16 @@ impl PageCurlResources {
     /// （捕获纹理与它一致）。`SHADERS_METALLIB_FALLBACK` 只在 metallib 缺函数时
     /// 给出可读的报错线索。
     pub(super) fn new(
-        device: &metal::Device,
-        library: &metal::LibraryRef,
+        device: &ProtocolObject<dyn MTLDevice>,
+        library: &ProtocolObject<dyn MTLLibrary>,
         // 几何在 `prepare` 里建（那边才用得到统一/离散内存的判据），这里用不上。
         _is_unified_memory: bool,
         target_format: metal::MTLPixelFormat,
     ) -> Self {
-        let mesh_pipeline = Self::build_mesh_pipeline(device, library, target_format);
-        let shadow_pipeline = Self::build_shadow_pipeline(device, library);
+        let device = device_ref(device);
+        let library = library_ref(library);
+        let mesh_pipeline = Self::build_mesh_pipeline(&device, library, target_format);
+        let shadow_pipeline = Self::build_shadow_pipeline(&device, library);
 
         // 捕获纹理与卷曲网格是 1:1 的设备像素。最近邻既保住正文的锐度，也避免
         // 线性过滤在矩形外圈与清屏色之间揉出一条半透明灰边（母本同款 NEAREST）。
@@ -270,10 +318,11 @@ impl PageCurlResources {
     pub(super) fn prepare(
         &mut self,
         scene: &Scene,
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         is_unified_memory: bool,
         size: Size<DevicePixels>,
     ) {
+        let device = device_ref(device);
         let meshes = scene.page_curl_meshes.as_slice();
         if meshes.is_empty() {
             self.frames.clear();
@@ -329,8 +378,8 @@ impl PageCurlResources {
         self.frame_uniforms = frame_uniforms;
         self.frames = frames;
 
-        self.ensure_shadow(device);
-        self.ensure_depth(device, size);
+        self.ensure_shadow(&device);
+        self.ensure_depth(&device, size);
     }
 
     fn ensure_shadow(&mut self, device: &metal::Device) {
@@ -359,7 +408,7 @@ impl PageCurlResources {
             return;
         }
         let texture = new_texture(
-            device,
+            &device,
             metal::MTLPixelFormat::Depth32Float,
             size.width.0.max(1) as u32,
             size.height.0.max(1) as u32,
@@ -371,10 +420,11 @@ impl PageCurlResources {
     /// 正面捕获纹理，整窗大小、格式与主目标一致。
     pub(super) fn capture_view(
         &mut self,
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         target_format: metal::MTLPixelFormat,
         size: Size<DevicePixels>,
     ) -> metal::Texture {
+        let device = device_ref(device);
         let needs_new = self
             .capture
             .as_ref()
@@ -382,7 +432,7 @@ impl PageCurlResources {
             .unwrap_or(true);
         if needs_new {
             let texture = new_texture(
-                device,
+                &device,
                 target_format,
                 size.width.0.max(1) as u32,
                 size.height.0.max(1) as u32,
@@ -396,10 +446,11 @@ impl PageCurlResources {
     /// 背面捕获纹理，尺寸/格式与正面一致。
     pub(super) fn back_capture_view(
         &mut self,
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         target_format: metal::MTLPixelFormat,
         size: Size<DevicePixels>,
     ) -> metal::Texture {
+        let device = device_ref(device);
         let needs_new = self
             .back_capture
             .as_ref()
@@ -407,7 +458,7 @@ impl PageCurlResources {
             .unwrap_or(true);
         if needs_new {
             let texture = new_texture(
-                device,
+                &device,
                 target_format,
                 size.width.0.max(1) as u32,
                 size.height.0.max(1) as u32,
@@ -421,10 +472,11 @@ impl PageCurlResources {
     /// 进场页捕获纹理（第 3 层），尺寸/格式与正面、背面一致。
     pub(super) fn incoming_capture_view(
         &mut self,
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         target_format: metal::MTLPixelFormat,
         size: Size<DevicePixels>,
     ) -> metal::Texture {
+        let device = device_ref(device);
         let needs_new = self
             .incoming_capture
             .as_ref()
@@ -432,7 +484,7 @@ impl PageCurlResources {
             .unwrap_or(true);
         if needs_new {
             let texture = new_texture(
-                device,
+                &device,
                 target_format,
                 size.width.0.max(1) as u32,
                 size.height.0.max(1) as u32,
@@ -448,7 +500,8 @@ impl PageCurlResources {
     /// 多网格帧（平移翻页的两张平摊网格）里 shadow map 的内容其实没人读 ——
     /// 平摊分支在 shadow 采样之前就 return 了；这里把拼接后的整份几何画一遍，
     /// 只是让那一趟有东西可画。
-    pub(super) fn encode_shadow(&self, command_buffer: &metal::CommandBufferRef) {
+    pub(super) fn encode_shadow(&self, command_buffer: &ProtocolObject<dyn MTLCommandBuffer>) {
+        let command_buffer = command_buffer_ref(command_buffer);
         let (Some(frame), Some(geometry), Some(shadow)) = (
             self.frames.first(),
             self.geometry.as_ref(),
@@ -498,10 +551,12 @@ impl PageCurlResources {
     /// 网格各盖半屏，从前只画先入树的那一张，另一张整帧不存在）。
     pub(super) fn encode_mesh_pass(
         &self,
-        command_buffer: &metal::CommandBufferRef,
-        target: &metal::TextureRef,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        target: &ProtocolObject<dyn MTLTexture>,
         size: Size<DevicePixels>,
     ) {
+        let command_buffer = command_buffer_ref(command_buffer);
+        let target = texture_ref(target);
         if self.frames.is_empty() {
             return;
         }
@@ -612,6 +667,20 @@ pub(crate) fn scissor_rect(bounds: &Bounds<ScaledPixels>, size: Size<DevicePixel
         y,
         width: right.saturating_sub(x),
         height: bottom.saturating_sub(y),
+    }
+}
+
+/// 渲染器那一侧用的是 objc2-metal 的 `MTLScissorRect`（同一个 C 结构，类型不同）。
+pub(super) fn scissor_rect_objc(
+    bounds: &Bounds<ScaledPixels>,
+    size: Size<DevicePixels>,
+) -> objc2_metal::MTLScissorRect {
+    let rect = scissor_rect(bounds, size);
+    objc2_metal::MTLScissorRect {
+        x: rect.x as usize,
+        y: rect.y as usize,
+        width: rect.width as usize,
+        height: rect.height as usize,
     }
 }
 

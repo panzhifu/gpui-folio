@@ -1,4 +1,5 @@
 use crate::metal_atlas::MetalAtlas;
+use crate::page_curl;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use gpui::{
@@ -143,6 +144,7 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     polychrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     surfaces_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    page_curl: page_curl::PageCurlResources,
     unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
@@ -394,6 +396,13 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         )?;
 
+        let page_curl = page_curl::PageCurlResources::new(
+            &device,
+            &library,
+            is_unified_memory,
+            metal::MTLPixelFormat::BGRA8Unorm,
+        );
+
         let command_queue = device.newCommandQueue().context("creating command queue")?;
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
         #[expect(
@@ -431,6 +440,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            page_curl,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -512,6 +522,8 @@ impl MetalRenderer {
         if let Err(error) = self.update_path_intermediate_textures(size) {
             log::error!("failed to resize path textures: {error:#}");
         }
+        // 捕获/深度纹理与几何缓存都按窗口尺寸建，换尺寸全部重建。
+        self.page_curl.invalidate_size_dependent();
     }
 
     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) -> Result<()> {
@@ -854,9 +866,87 @@ impl MetalRenderer {
         let command_buffer = command_queue
             .commandBuffer()
             .context("creating command buffer")?;
+
+        // 仿真翻页：prepare（顶点/索引/uniform）与光源方向的 shadow map 先行，
+        // 捕获 pass 之前 —— 与母本 wgpu 同一顺序。
+        self.page_curl
+            .prepare(scene, &self.device, self.is_unified_memory, viewport_size);
+        self.page_curl.encode_shadow(&command_buffer);
+
         let alpha = if self.opaque { 1. } else { 0. };
 
-        let mut command_encoder = new_command_encoder_for_texture(
+        // 页面捕获：同一棵场景按层过滤重画到离屏纹理，跳过卷曲网格防自采样。
+        // 捕获纹理里被写过的只有 scissor 的页框那块，清屏色用纸色 —— 采样落在
+        // 矩形外一两个像素时读到的应是纸，不是黑（母本同口径）。
+        if let Some(bounds) = scene.page_capture {
+            let clear_color = paper_clear_color(scene.page_capture_clear_color);
+            let capture = self.page_curl.capture_view(
+                &self.device,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                viewport_size,
+            );
+            self.encode_batches(
+                scene,
+                instance_bindings,
+                writer,
+                &command_buffer,
+                page_curl::as_objc_texture(&capture),
+                viewport_size,
+                Some(clear_color),
+                Some(bounds),
+                gpui::capture_order_range(1),
+                true,
+                surface_textures,
+            )?;
+        }
+        if let Some(bounds) = scene.page_capture_back {
+            let clear_color = paper_clear_color(scene.page_capture_back_clear_color);
+            let back = self.page_curl.back_capture_view(
+                &self.device,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                viewport_size,
+            );
+            self.encode_batches(
+                scene,
+                instance_bindings,
+                writer,
+                &command_buffer,
+                page_curl::as_objc_texture(&back),
+                viewport_size,
+                Some(clear_color),
+                Some(bounds),
+                gpui::capture_order_range(2),
+                true,
+                surface_textures,
+            )?;
+        }
+        if let Some(bounds) = scene.page_capture_incoming {
+            let clear_color = paper_clear_color(scene.page_capture_incoming_clear_color);
+            let incoming = self.page_curl.incoming_capture_view(
+                &self.device,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                viewport_size,
+            );
+            self.encode_batches(
+                scene,
+                instance_bindings,
+                writer,
+                &command_buffer,
+                page_curl::as_objc_texture(&incoming),
+                viewport_size,
+                Some(clear_color),
+                Some(bounds),
+                gpui::capture_order_range(3),
+                true,
+                surface_textures,
+            )?;
+        }
+
+        // 主 pass：只画 < CAPTURE_ORDER_BASE；命中卷曲批次时暂停-补一趟-以 Load 恢复。
+        self.encode_batches(
+            scene,
+            instance_bindings,
+            writer,
             &command_buffer,
             texture,
             viewport_size,
@@ -866,9 +956,46 @@ impl MetalRenderer {
                 blue: 0.,
                 alpha,
             }),
+            None,
+            0..gpui::CAPTURE_ORDER_BASE,
+            false,
+            surface_textures,
         )?;
 
-        for batch in scene.batches() {
+        Ok(command_buffer)
+    }
+
+    /// 把一个层段里的批次画进 `texture`。卷曲网格的 arm 在主 pass（skip_curl =
+    /// false）里暂停-补一趟-以 Load 恢复；捕获 pass 里直接跳过。
+    #[allow(clippy::too_many_arguments)]
+    fn encode_batches(
+        &mut self,
+        scene: &Scene,
+        instance_bindings: &InstanceBindings,
+        writer: &mut InstanceBufferWriter,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        texture: &ProtocolObject<dyn MTLTexture>,
+        viewport_size: Size<DevicePixels>,
+        clear_color: Option<MTLClearColor>,
+        capture_bounds: Option<Bounds<ScaledPixels>>,
+        layer_range: std::ops::Range<gpui::DrawOrder>,
+        skip_curl: bool,
+        surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
+    ) -> Result<()> {
+        let mut command_encoder = new_command_encoder_for_texture(
+            command_buffer,
+            texture,
+            viewport_size,
+            clear_color,
+        )?;
+        if let Some(bounds) = capture_bounds {
+            let scissor = crate::page_curl::scissor_rect_objc(&bounds, viewport_size);
+            if scissor.width > 0 && scissor.height > 0 {
+                command_encoder.setScissorRect(scissor);
+            }
+        }
+
+        for batch in scene.batches_in(layer_range) {
             match batch {
                 PrimitiveBatch::Shadows(range) => {
                     self.draw_shadows(range, instance_bindings, viewport_size, &command_encoder)
@@ -884,11 +1011,11 @@ impl MetalRenderer {
                         paths,
                         writer,
                         viewport_size,
-                        &command_buffer,
+                        command_buffer,
                     )?;
 
                     command_encoder = new_command_encoder_for_texture(
-                        &command_buffer,
+                        command_buffer,
                         texture,
                         viewport_size,
                         None,
@@ -938,13 +1065,34 @@ impl MetalRenderer {
                         return Err(error);
                     }
                 }
+                PrimitiveBatch::PageCurlMeshes(_) => {
+                    if skip_curl {
+                        continue;
+                    }
+                    // 仿真翻页：暂停主 pass，把卷曲网格（带自己的深度）画进主颜色
+                    // 附件，再以 Load 重开 —— 母本 wgpu 的同一套编排。
+                    command_encoder.endEncoding();
+                    self.page_curl
+                        .encode_mesh_pass(command_buffer, texture, viewport_size);
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        texture,
+                        viewport_size,
+                        None,
+                    )?;
+                }
+                PrimitiveBatch::BackdropGlasses(_) => {
+                    // 背景模糊只有 wgpu 那条渲染路径实现（Android 与 Linux 桌面）。这一端
+                    // 跳过玻璃：屏上只剩压在它上面的那层半透明 tint，与加这个 primitive
+                    // 之前逐像素相同。
+                }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
 
         command_encoder.endEncoding();
 
-        Ok(command_buffer)
+        Ok(())
     }
 
     fn draw_paths_to_intermediate(
@@ -1516,6 +1664,24 @@ fn new_command_encoder_for_texture(
         zfar: 1.0,
     });
     Ok(command_encoder)
+}
+
+/// 捕获 pass 的清屏色：app 给了纸色用纸色，缺省白 —— 与母本 wgpu 的
+/// `unwrap_or(wgpu::Color::WHITE)` 同口径。
+fn paper_clear_color(clear: Option<gpui::Rgba>) -> MTLClearColor {
+    clear
+        .map(|color| MTLClearColor {
+            red: color.r as f64,
+            green: color.g as f64,
+            blue: color.b as f64,
+            alpha: color.a as f64,
+        })
+        .unwrap_or(MTLClearColor {
+            red: 1.0,
+            green: 1.0,
+            blue: 1.0,
+            alpha: 1.0,
+        })
 }
 
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
