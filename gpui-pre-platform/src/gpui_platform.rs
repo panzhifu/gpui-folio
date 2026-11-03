@@ -1,29 +1,11 @@
 //! Convenience crate that re-exports GPUI's platform traits and the
 //! `current_platform` constructor so consumers don't need `#[cfg]` gating.
-//!
-//! Vendored copy. Against upstream 0.3.9 two things changed: the desktop-Linux
-//! predicate moved from `target_os = "linux"` to
-//! `all(target_os = "linux", not(target_env = "ohos"))`, so the HarmonyOS triples
-//! (which report `target_os = "linux"`) stop pulling `gpui-pre-linux` and its
-//! X11 / Wayland link flags; and `current_platform` gained explicit arms for
-//! `target_env = "ohos"` and for `target_os = "android"` / `target_os = "ios"`,
-//! which upstream simply leaves unhandled (a missing arm makes the fn body return
-//! `()` and the crate then fails to compile for those triples — enough to break
-//! any consumer that depends on this facade unconditionally). Measured on
-//! `aarch64-linux-android`; the `ios` arm is the same shape but no iOS target is
-//! installed here, so it is unverified. See `Cargo.toml`
-//! for why all of that has to happen here rather than in a consumer.
 
 pub use gpui::Platform;
 
-#[cfg_attr(
-    any(
-        all(target_os = "linux", target_env = "ohos"),
-        target_os = "android",
-        target_os = "ios"
-    ),
-    allow(unused_imports)
-)]
+#[cfg(target_family = "wasm")]
+pub use gpui_web::WebBackendPreference;
+
 use std::rc::Rc;
 
 /// Returns a background executor for the current platform.
@@ -32,12 +14,6 @@ pub fn background_executor() -> gpui::BackgroundExecutor {
 }
 
 pub fn application() -> gpui::Application {
-    #[cfg(target_family = "wasm")]
-    {
-        application_with_web_backend(gpui_web::WebBackendPreference::Auto)
-    }
-
-    #[cfg(not(target_family = "wasm"))]
     gpui::Application::with_platform(current_platform(false))
 }
 
@@ -50,16 +26,13 @@ pub fn headless() -> gpui::Application {
 /// It starts windowed in the process's own environment, or headless if that names no allowed
 /// display server. Set another initial mode with [`gpui::Application::with_windowing`], and
 /// switch later with [`gpui::App::request_windowing`].
-#[cfg(any(
-    all(target_os = "linux", not(target_env = "ohos")),
-    target_os = "freebsd"
+#[cfg(all(
+    any(target_os = "linux", target_os = "freebsd"),
+    not(target_env = "ohos")
 ))]
 pub fn linux(allowed_modes: gpui::WindowingModes) -> gpui::Application {
     gpui::Application::with_platform(gpui_linux::linux_platform(allowed_modes))
 }
-
-#[cfg(target_family = "wasm")]
-pub use gpui_web::WebBackendPreference;
 
 #[cfg(target_family = "wasm")]
 pub fn application_with_web_backend(backend_preference: WebBackendPreference) -> gpui::Application {
@@ -67,16 +40,14 @@ pub fn application_with_web_backend(backend_preference: WebBackendPreference) ->
         true,
         backend_preference,
     ));
-    let http_client = std::sync::Arc::new(platform.fetch_http_client());
-    gpui::Application::with_platform(platform).with_http_client(http_client)
+    gpui::Application::with_platform(platform)
 }
 
 /// Unlike `application`, this function returns a single-threaded web application.
 #[cfg(target_family = "wasm")]
 pub fn single_threaded_web() -> gpui::Application {
     let platform = Rc::new(gpui_web::WebPlatform::new(false));
-    let http_client = std::sync::Arc::new(platform.fetch_http_client());
-    gpui::Application::with_platform(platform).with_http_client(http_client)
+    gpui::Application::with_platform(platform)
 }
 
 /// Initializes panic hooks and logging for the web platform.
@@ -89,61 +60,43 @@ pub fn web_init() {
 
 /// Returns the default [`Platform`] for the current OS.
 pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
-    #[cfg(target_os = "macos")]
-    {
-        Rc::new(gpui_macos::MacPlatform::new(headless))
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        Rc::new(
+    cfg_select! {
+        target_os = "ios" => gpui_ios::current_platform(headless),
+        target_os = "macos" => Rc::new(gpui_macos::MacPlatform::new(headless)),
+        target_os = "windows" => Rc::new(
             gpui_windows::WindowsPlatform::new(headless)
                 .expect("failed to initialize Windows platform"),
-        )
-    }
-
-    #[cfg(any(
-        all(target_os = "linux", not(target_env = "ohos")),
-        target_os = "freebsd"
-    ))]
-    {
-        gpui_linux::current_platform(headless)
-    }
-
-    // HarmonyOS has no platform behind this facade: the `Platform` impl comes from
-    // `gpui-pre-mobile`'s ohos backend (`gpui_mobile::ohos::current_platform`), driven
-    // by the ArkTS `XComponent` rather than a display server. Reaching this arm means
-    // something called `gpui_platform::application()` on HarmonyOS — falling through to
-    // a desktop platform would hide that, so it says so out loud.
-    #[cfg(all(target_os = "linux", target_env = "ohos"))]
-    {
-        let _ = headless;
-        panic!(
-            "gpui_platform::current_platform: HarmonyOS has no desktop platform; use gpui_mobile::ohos::current_platform"
-        )
-    }
-
-    // Android and iOS are the same shape as HarmonyOS: the `Platform` impl lives in
-    // `gpui-pre-mobile` (`gpui_mobile::android::current_platform` / its iOS twin), driven by
-    // the host Activity / UIKit window rather than a display server. This facade cannot reach
-    // it — `gpui-mobile` already pins this crate as a workspace member, so depending back on
-    // `gpui_mobile` here would be a cycle. The arm exists so a consumer that depends on
-    // `gpui_platform` *unconditionally* (gpui-kit gates it behind `cfg(not(any(ios, android)))`,
-    // third-party component libraries typically don't) still cross-compiles for those triples;
-    // calling it is a wiring mistake, so it says so out loud instead of returning a unit value
-    // that would not type-check.
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    {
-        let _ = headless;
-        panic!(
-            "gpui_platform::current_platform: this mobile triple has no desktop platform; use gpui_mobile's own current_platform"
-        )
-    }
-
-    #[cfg(target_family = "wasm")]
-    {
-        let _ = headless;
-        Rc::new(gpui_web::WebPlatform::new(true))
+        ),
+        all(
+            any(target_os = "linux", target_os = "freebsd"),
+            not(target_env = "ohos")
+        ) => gpui_linux::current_platform(headless),
+        // HarmonyOS reports `target_os = "linux"`; its `Platform` impl lives in
+        // `gpui-pre-mobile` (driven by the ArkTS XComponent), so reaching this
+        // facade there is a wiring mistake, not a desktop fallback.
+        target_env = "ohos" => {
+            let _ = headless;
+            panic!(
+                "gpui_platform::current_platform: HarmonyOS has no desktop platform; use gpui_mobile::ohos::current_platform"
+            )
+        },
+        // Android is the same shape: the backend lives in `gpui-pre-mobile`.
+        // Without this arm a missing `cfg_select!` branch makes the fn body
+        // return `()`, and any consumer that depends on this facade
+        // unconditionally fails to compile for the triple.
+        target_os = "android" => {
+            let _ = headless;
+            panic!(
+                "gpui_platform::current_platform: Android has no desktop platform; use gpui_mobile's own current_platform"
+            )
+        },
+        target_family = "wasm" => {
+            let _ = headless;
+            Rc::new(gpui_web::WebPlatform::new_with_backend(
+                true,
+                gpui_web::WebBackendPreference::Auto,
+            ))
+        },
     }
 }
 
@@ -170,7 +123,7 @@ pub fn current_headless_renderer() -> anyhow::Result<Option<Box<dyn gpui::Platfo
     #[cfg(target_os = "macos")]
     {
         Ok(Some(Box::new(
-            gpui_macos::metal_renderer::MetalHeadlessRenderer::new(),
+            gpui_macos::metal_renderer::MetalHeadlessRenderer::new()?,
         )))
     }
 

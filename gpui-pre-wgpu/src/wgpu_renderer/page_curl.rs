@@ -128,7 +128,7 @@ pub(super) fn create_pipelines(
         source: wgpu::ShaderSource::Wgsl(PAGE_CURL_SHADERS.into()),
     });
 
-    let vertex_buffers = [wgpu::VertexBufferLayout {
+    let vertex_buffers = [Some(wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<gpui::PageCurlVertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &[
@@ -143,7 +143,7 @@ pub(super) fn create_pipelines(
                 shader_location: 1,
             },
         ],
-    }];
+    })];
 
     let create = |label: &str,
                   vs: &str,

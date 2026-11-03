@@ -1262,8 +1262,37 @@ fn check_is_known_emoji_font(postscript_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[cfg(feature = "test-support")]
     use std::{cell::RefCell, rc::Rc};
+    use std::{
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    /// 本地探针（不提交）：`FOLIO_FONT=<ttf>` 指一份真字体，验证批量注册交回的
+    /// 家族名与 `font_has_glyph` 的真实 cmap 判定。
+    #[test]
+    #[ignore = "local probe；FOLIO_FONT 指字体路径"]
+    fn local_font_families_and_m_probe() -> Result<()> {
+        let path = std::env::var("FOLIO_FONT").expect("FOLIO_FONT");
+        let bytes = std::fs::read(path)?;
+        let text_system = gpui::TextSystem::new(Arc::new(
+            CosmicTextSystem::new_without_system_fonts("IBM Plex Sans"),
+        ));
+        let families = text_system.add_fonts_with_families(vec![Cow::Owned(bytes)])?;
+        println!("families={families:?}");
+        for family in families.iter().flatten() {
+            let font = gpui::font(family.as_str());
+            println!(
+                "{family}: has_m={} has_汉={}",
+                text_system.font_has_glyph(&font, 'm'),
+                text_system.font_has_glyph(&font, '汉'),
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn all_font_names_tracks_available_families() -> Result<()> {
@@ -1318,6 +1347,70 @@ mod tests {
         let text_system = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
         text_system.add_fonts(vec![Cow::Borrowed(IBM_PLEX)])?;
         Ok(text_system)
+    }
+
+    #[test]
+    fn cached_font_resolution_does_not_wait_for_cold_lookups() -> Result<()> {
+        for family in [".ZedSans", "Missing Font"] {
+            let platform_text_system = Arc::new(text_system()?);
+            let text_system = gpui::TextSystem::new(platform_text_system.clone());
+            let cached = gpui::font(family);
+            let expected = platform_text_system.font_id(&gpui::font(".ZedSans"))?;
+            assert_eq!(text_system.resolve_font(&cached), expected);
+            let (sender, receiver) = mpsc::channel();
+
+            thread::scope(|scope| {
+                let backend = platform_text_system.0.read();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let cold = scope.spawn(|| text_system.resolve_font(&cached.clone().bold()));
+                while !platform_text_system.0.is_locked_exclusive() && Instant::now() < deadline {
+                    thread::yield_now();
+                }
+                let cold_waiting = platform_text_system.0.is_locked_exclusive();
+                let warm = scope.spawn(|| sender.send(text_system.resolve_font(&cached)));
+                let result =
+                    receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+                drop(backend);
+                let cold_result = cold.join();
+                let warm_result = warm.join();
+
+                assert!(cold_waiting);
+                assert_eq!(result.expect("cached lookup blocked"), expected);
+                assert_eq!(cold_result.expect("cold lookup panicked"), expected);
+                warm_result
+                    .expect("warm lookup panicked")
+                    .expect("receiver dropped");
+            });
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adding_fonts_retries_cached_font_failures() -> Result<()> {
+        let platform_text_system = Arc::new(CosmicTextSystem::new_without_system_fonts("Lilex"));
+        let text_system = gpui::TextSystem::new(platform_text_system.clone());
+        text_system.add_fonts(vec![Cow::Borrowed(IBM_PLEX)])?;
+        let original_fallback = platform_text_system.font_id(&gpui::font(".ZedSans"))?;
+        let requests = [
+            gpui::Font::default(),
+            gpui::font("Lilex"),
+            gpui::font("Missing Font"),
+        ];
+        for requested in &requests {
+            assert_eq!(text_system.resolve_font(requested), original_fallback);
+        }
+        assert_eq!(
+            text_system.get_font_for_id(original_fallback),
+            Some(gpui::font(".ZedSans"))
+        );
+
+        text_system.add_fonts(vec![Cow::Borrowed(LILEX)])?;
+        for (requested, resolved) in requests.iter().zip([".SystemUIFont", "Lilex", ".ZedMono"]) {
+            let installed = platform_text_system.font_id(&gpui::font(resolved))?;
+            assert_ne!(installed, original_fallback);
+            assert_eq!(text_system.resolve_font(requested), installed);
+        }
+        Ok(())
     }
 
     #[test]

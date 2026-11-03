@@ -210,7 +210,7 @@ fn create_pipelines(
                   fs: &str,
                   layout: &wgpu::BindGroupLayout,
                   target: &wgpu::ColorTargetState,
-                  vertex_buffers: &[wgpu::VertexBufferLayout<'_>]| {
+                  vertex_buffers: &[Option<wgpu::VertexBufferLayout<'_>>]| {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(label),
             bind_group_layouts: &[Some(layout)],
@@ -248,7 +248,7 @@ fn create_pipelines(
     };
 
     // 一条玻璃 = 一个实例。步进是 Instance，四个顶点共用同一条记录。
-    let glass_vertices = [wgpu::VertexBufferLayout {
+    let glass_vertices = [Some(wgpu::VertexBufferLayout {
         array_stride: size_of::<GpuGlass>() as u64,
         step_mode: wgpu::VertexStepMode::Instance,
         attributes: &[
@@ -273,7 +273,7 @@ fn create_pipelines(
                 shader_location: 3,
             },
         ],
-    }];
+    })];
 
     BackdropPipelines {
         downsample: create(
