@@ -11,8 +11,8 @@ gmpagecurl-ios 那套「圆柱 / 盒子」纸模型在 GPU 上做网格形变、
 
 | 目录 | 内容 |
 | --- | --- |
-| `gpui-pre/` | gpui-pre 0.3.9 源码；新增 `Mesh` primitive、`paint_mesh`、`capture_page_region` |
-| `gpui-pre-wgpu/` | gpui-pre-wgpu 0.3.9 源码；新增页面捕获 pass、卷曲网格管线、shadow pass |
+| `gpui-pre/` | gpui-pre 0.3.11 源码；新增 `Mesh` primitive、`paint_mesh`、`capture_page_region` |
+| `gpui-pre-wgpu/` | gpui-pre-wgpu 0.3.11 源码；新增页面捕获 pass、卷曲网格管线、shadow pass |
 | `folio-curl/` | 纯 CPU 的页面网格与 uniform 定义；可单测，不依赖 gpui |
 
 ## 为什么不直接在 folio 里画
@@ -34,8 +34,8 @@ folio 根 `Cargo.toml` 用远端提交（推荐，构建可复现）：
 
 ```toml
 [patch.crates-io]
-gpui-pre = { git = "https://github.com/panzhifu/gpui-folio", rev = "3ebf9172532c82c90e55e11e99604af7b33cc0dd" }
-gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-folio", rev = "3ebf9172532c82c90e55e11e99604af7b33cc0dd" }
+gpui-pre = { git = "https://github.com/panzhifu/gpui-folio", rev = "9df6f753841792b73d7357edf480dbb85fb71818" }
+gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-folio", rev = "9df6f753841792b73d7357edf480dbb85fb71818" }
 ```
 
 本地开发也可以继续用 path：
@@ -46,7 +46,7 @@ gpui-pre = { path = "../gpui-folio/gpui-pre" }
 gpui-pre-wgpu = { path = "../gpui-folio/gpui-pre-wgpu" }
 ```
 
-包名与版本必须保持 `gpui-pre 0.3.9` / `gpui-pre-wgpu 0.3.9`：`gpui-kit` 与
+包名与版本必须保持 `gpui-pre 0.3.11` / `gpui-pre-wgpu 0.3.11`：`gpui-kit` 与
 `gpui-mobile` 都精确依赖这两个版本，改版本会分出第二棵 gpui。Cargo 能从同一个
 git workspace 里解析这两个包，实测 `cargo metadata` 已通过。
 
