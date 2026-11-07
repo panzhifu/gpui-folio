@@ -2050,6 +2050,34 @@ mod tests {
     };
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
+    /// A face with no Latin 'm' must still load and resolve as a primary
+    /// font. DirectWrite never filtered such faces — this pins it, in
+    /// lockstep with the same removals in gpui-pre-wgpu (be92574) and
+    /// gpui-pre-apple (0b9c6cb). The fixture is folio's `glyf-min.ttf`
+    /// subsetted to 'A' with fontTools: its cmap holds exactly one
+    /// character and it is not 'm'.
+    #[test]
+    fn a_face_without_latin_m_loads_and_resolves_as_primary() -> Result<()> {
+        let fonts = DirectWriteTextSystem::new(None)?;
+        fonts.add_fonts(vec![std::borrow::Cow::Borrowed(
+            include_bytes!("testdata/no-m.ttf").as_slice(),
+        )])?;
+
+        let id = fonts.font_id(&Font {
+            family: "Test TTF".into(),
+            ..Default::default()
+        })?;
+        assert!(
+            fonts.glyph_for_char(id, 'm').is_none(),
+            "precondition: the fixture really has no 'm' glyph"
+        );
+        assert!(
+            fonts.glyph_for_char(id, 'A').is_some(),
+            "the glyphs it does have must be reachable"
+        );
+        Ok(())
+    }
+
     #[test]
     fn unicode_line_separators_preserve_shaped_line_cursor() -> Result<()> {
         check_unicode_separator_cursor('\u{2028}')
