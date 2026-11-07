@@ -54,10 +54,10 @@ struct CosmicTextSystemState {
     /// Contains all already loaded fonts, including all faces. Indexed by `FontId`.
     loaded_fonts: Vec<LoadedFont>,
     loaded_font_ids_by_key: HashMap<LoadedFontKey, FontId>,
-    /// Caches the `FontId`s associated with a specific family to avoid iterating the font database
-    /// for every font face in a family. The bool is `allow_no_latin`: primary lookups (false)
-    /// filter faces without `m`, fallback lookups (true) keep them.
-    font_ids_by_family_cache: HashMap<(FontKey, bool), SmallVec<[FontId; 4]>>,
+    /// Caches the `FontId`s associated with a specific family to avoid iterating the font
+    /// database for every font face in a family. Primary and fallback lookups load the same
+    /// face set — there is no Latin filter anymore, so one entry per key suffices.
+    font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     system_font_fallback: String,
     missing_glyph_sink: Option<Arc<dyn MissingGlyphSink>>,
 }
@@ -202,19 +202,18 @@ impl PlatformTextSystem for CosmicTextSystem {
             font.features.clone(),
             font.fallbacks.clone(),
         );
-        let candidates = if let Some(font_ids) = state.font_ids_by_family_cache.get(&(key.clone(), false)) {
+        let candidates = if let Some(font_ids) = state.font_ids_by_family_cache.get(&key.clone()) {
             font_ids.as_slice()
         } else {
             let font_ids = state.load_family(
                 &font.family,
                 &font.features,
                 font.fallbacks.as_ref(),
-                false,
             )?;
             state
                 .font_ids_by_family_cache
-                .insert((key.clone(), false), font_ids);
-            state.font_ids_by_family_cache[&(key, false)].as_ref()
+                .insert(key.clone(), font_ids);
+            state.font_ids_by_family_cache[&key].as_ref()
         };
 
         let ix = find_best_match(font, candidates, &state)?;
@@ -385,7 +384,6 @@ impl CosmicTextSystemState {
         name: &str,
         features: &FontFeatures,
         fallbacks: Option<&FontFallbacks>,
-        allow_no_latin: bool,
     ) -> Result<SmallVec<[FontId; 4]>> {
         let loaded_font_key = FontKey::new(
             SharedString::from(name.to_owned()),
@@ -405,13 +403,13 @@ impl CosmicTextSystemState {
                         features.clone(),
                         None,
                     );
-                    let fb_cache_key = (fb_key, true);
+                    let fb_cache_key = fb_key;
                     let fb_ids = if let Some(cached) =
                         self.font_ids_by_family_cache.get(&fb_cache_key)
                     {
                         cached.clone()
                     } else {
-                        let loaded = self.load_family(fallback_name, features, None, true)?;
+                        let loaded = self.load_family(fallback_name, features, None)?;
                         self.font_ids_by_family_cache
                             .insert(fb_cache_key, loaded.clone());
                         loaded
@@ -460,32 +458,16 @@ impl CosmicTextSystemState {
                 .get_font(database_id, cosmic_text::Weight::NORMAL)
                 .context("Could not load font")?;
 
-            // HACK: To let the storybook run and render Windows caption icons. We should actually do better font fallback.
-            let allowed_bad_font_names = [
-                "SegoeFluentIcons", // NOTE: Segoe fluent icons postscript name is inconsistent
-                "Segoe Fluent Icons",
-            ];
-
-            // This only decides whether a face can be a primary font. The
-            // editor measures layout with the width of 'm' and would panic
-            // without it.
-            //
-            // Don't remove the face from the font database. Arabic, Devanagari
-            // and emoji fonts often have no Latin glyphs, and they are exactly
-            // what cosmic-text falls back to when the primary font lacks a
-            // glyph.
-            // Primary lookups (allow_no_latin = false) keep the editor's `m`
-            // requirement. Fallback lookups keep no-`m` faces: a CJK-only face
-            // can still cover glyphs the primary font lacks, and cosmic-text
-            // would otherwise have no way to reach it. This is the difference
-            // between "the face can't be the primary" and "the face is
-            // unusable".
-            if !allow_no_latin
-                && font.as_swash().charmap().map('m') == 0
-                && !allowed_bad_font_names.contains(&postscript_name.as_str())
-            {
-                continue;
-            };
+            // Faces without Latin glyphs are kept for primary lookups too.
+            // Upstream filters them here because Zed's editor measures layout
+            // with the width of 'm' and has no per-glyph fallback for ASCII;
+            // this snapshot has neither that editor nor that restriction —
+            // `pick_covering_slot` falls any uncovered character, ASCII
+            // included, through the fallback chain. Arabic, Devanagari and
+            // CJK-only fonts are exactly what a book wants as its body font,
+            // and dropping them from the primary candidates made
+            // `resolve_font` panic outright on platforms without system
+            // fallbacks (Android).
 
             let font_id = FontId(self.loaded_fonts.len());
             loaded_font_ids.push(font_id);
@@ -1178,9 +1160,9 @@ fn pick_covering_slot(
     fallback_chain: &[(FontId, SharedString)],
     covers: &impl Fn(FontId, char) -> bool,
 ) -> Option<usize> {
-    if (ch as u32) <= 0x7F {
-        return None;
-    }
+    // No ASCII special case: a CJK-only primary must be able to hand its
+    // digits and Latin over to the fallback chain instead of rendering
+    // `.notdef` boxes. Covered ASCII still lands on the primary below.
     if covers(primary, ch) {
         return None;
     }
@@ -1818,6 +1800,21 @@ mod tests {
             pick_covering_slot('\u{1F600}', Some(1), primary, &fb, &covers),
             None
         );
+    }
+
+    #[test]
+    fn ascii_falls_back_when_primary_lacks_it() {
+        // A CJK-only primary: only the fallback covers Latin. The old
+        // ASCII early-return pinned digits and letters to the primary slot,
+        // where they rendered as `.notdef` boxes.
+        let primary = fid(0);
+        let fb = chain(&[1]);
+        let covers = |id: FontId, ch: char| id == fid(1) && ch == 'a';
+        assert_eq!(
+            pick_covering_slot('a', None, primary, &fb, &covers),
+            Some(0)
+        );
+        assert_eq!(pick_covering_slot('a', Some(0), primary, &fb, &covers), Some(0));
     }
 
     #[test]
