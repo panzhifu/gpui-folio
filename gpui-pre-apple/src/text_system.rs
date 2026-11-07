@@ -793,6 +793,36 @@ mod tests {
         assert!(!layout.runs.is_empty());
     }
 
+    /// A face with no Latin 'm' must still load and resolve as a primary
+    /// font. Upstream skipped such faces in `load_family` because the editor
+    /// measures layout with 'm' and had no per-glyph fallback for ASCII;
+    /// this snapshot has neither — CoreText cascades uncovered characters
+    /// through the font's fallback chain, in lockstep with the same removal
+    /// in gpui-pre-wgpu. The fixture is folio's `glyf-min.ttf` subsetted to
+    /// 'A' with fontTools: its cmap holds exactly one character and it is
+    /// not 'm'.
+    #[test]
+    fn a_face_without_latin_m_loads_and_resolves_as_primary() {
+        let fonts = AppleTextSystem::new();
+        fonts
+            .add_fonts(vec![std::borrow::Cow::Borrowed(
+                include_bytes!("testdata/no-m.ttf").as_slice(),
+            )])
+            .expect("registering the fixture font should succeed");
+
+        let id = fonts
+            .font_id(&font("Test TTF"))
+            .expect("a face without Latin 'm' still resolves as primary");
+        assert!(
+            fonts.glyph_for_char(id, 'm').is_none(),
+            "precondition: the fixture really has no 'm' glyph"
+        );
+        assert!(
+            fonts.glyph_for_char(id, 'A').is_some(),
+            "the glyphs it does have must be reachable"
+        );
+    }
+
     #[test]
     fn test_layout_line_sets_a_lone_run_at_its_exact_size() {
         use core_foundation::attributed_string::CFMutableAttributedString;
