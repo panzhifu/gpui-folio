@@ -1185,6 +1185,30 @@ impl Hash for RenderGlyphParams {
     }
 }
 
+/// The width of a font face relative to the normal face in the family.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum FontStretch {
+    /// The narrowest static face.
+    UltraCondensed,
+    /// Narrower than condensed, wider than ultra-condensed.
+    ExtraCondensed,
+    /// A static condensed face.
+    Condensed,
+    /// Slightly narrower than normal.
+    SemiCondensed,
+    /// The normal static face.
+    #[default]
+    Normal,
+    /// Slightly wider than normal.
+    SemiExpanded,
+    /// A static expanded face.
+    Expanded,
+    /// Wider than expanded, narrower than ultra-expanded.
+    ExtraExpanded,
+    /// The widest static face.
+    UltraExpanded,
+}
+
 /// The configuration details for identifying a specific font.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Font {
@@ -1204,6 +1228,9 @@ pub struct Font {
 
     /// The font style.
     pub style: FontStyle,
+
+    /// The static width variant of the font face.
+    pub stretch: FontStretch,
 }
 
 impl Default for Font {
@@ -1219,6 +1246,7 @@ pub fn font(family: impl Into<SharedString>) -> Font {
         features: FontFeatures::default(),
         weight: FontWeight::default(),
         style: FontStyle::default(),
+        stretch: FontStretch::default(),
         fallbacks: None,
     }
 }

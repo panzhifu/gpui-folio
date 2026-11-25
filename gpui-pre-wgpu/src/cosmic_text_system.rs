@@ -28,14 +28,21 @@ struct FontKey {
     family: SharedString,
     features: FontFeatures,
     fallbacks: Option<FontFallbacks>,
+    stretch: Stretch,
 }
 
 impl FontKey {
-    fn new(family: SharedString, features: FontFeatures, fallbacks: Option<FontFallbacks>) -> Self {
+    fn new(
+        family: SharedString,
+        features: FontFeatures,
+        fallbacks: Option<FontFallbacks>,
+        stretch: Stretch,
+    ) -> Self {
         Self {
             family,
             features,
             fallbacks,
+            stretch,
         }
     }
 }
@@ -170,10 +177,7 @@ impl PlatformTextSystem for CosmicTextSystem {
         self.0.write().add_fonts(fonts)
     }
 
-    fn add_fonts_with_families(
-        &self,
-        fonts: Vec<Cow<'static, [u8]>>,
-    ) -> Result<Vec<Vec<String>>> {
+    fn add_fonts_with_families(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<Vec<Vec<String>>> {
         self.0.write().add_fonts_with_families(fonts)
     }
 
@@ -201,6 +205,7 @@ impl PlatformTextSystem for CosmicTextSystem {
             font.family.clone(),
             font.features.clone(),
             font.fallbacks.clone(),
+            cosmic_stretch(font.stretch),
         );
         let candidates = if let Some(font_ids) = state.font_ids_by_family_cache.get(&key.clone()) {
             font_ids.as_slice()
@@ -209,10 +214,9 @@ impl PlatformTextSystem for CosmicTextSystem {
                 &font.family,
                 &font.features,
                 font.fallbacks.as_ref(),
+                cosmic_stretch(font.stretch),
             )?;
-            state
-                .font_ids_by_family_cache
-                .insert(key.clone(), font_ids);
+            state.font_ids_by_family_cache.insert(key.clone(), font_ids);
             state.font_ids_by_family_cache[&key].as_ref()
         };
 
@@ -301,7 +305,11 @@ impl CosmicTextSystemState {
         &self.loaded_fonts[font_id.0]
     }
 
-    fn font_match_properties(&self, font_id: FontId) -> Option<FontMatchProperties> {
+    fn font_match_properties(
+        &self,
+        font_id: FontId,
+        stretch: Stretch,
+    ) -> Option<FontMatchProperties> {
         let loaded_font = self.loaded_font(font_id);
         let Some(face) = self.font_system.db().face(loaded_font.font.id()) else {
             log::warn!("font face not found in database for font_id {:?}", font_id);
@@ -314,7 +322,7 @@ impl CosmicTextSystemState {
 
         Some(FontMatchProperties {
             primary_family_name: first_family.0.clone().into(),
-            stretch: face.stretch,
+            stretch,
             style: face.style,
             weight: face.weight,
             features: loaded_font.features.clone(),
@@ -324,7 +332,7 @@ impl CosmicTextSystemState {
 
     fn prewarm_fonts(&mut self, font_ids: &[FontId]) {
         for &font_id in font_ids {
-            let Some(properties) = self.font_match_properties(font_id) else {
+            let Some(properties) = self.font_match_properties(font_id, Stretch::Normal) else {
                 continue;
             };
             let primary_attributes =
@@ -384,11 +392,13 @@ impl CosmicTextSystemState {
         name: &str,
         features: &FontFeatures,
         fallbacks: Option<&FontFallbacks>,
+        stretch: Stretch,
     ) -> Result<SmallVec<[FontId; 4]>> {
         let loaded_font_key = FontKey::new(
             SharedString::from(name.to_owned()),
             features.clone(),
             fallbacks.cloned(),
+            stretch,
         );
 
         // recurse with `fallbacks = None` so a fallback family cannot pull in
@@ -402,6 +412,7 @@ impl CosmicTextSystemState {
                         SharedString::from(fallback_name.clone()),
                         features.clone(),
                         None,
+                        stretch,
                     );
                     let fb_cache_key = fb_key;
                     let fb_ids = if let Some(cached) =
@@ -409,7 +420,7 @@ impl CosmicTextSystemState {
                     {
                         cached.clone()
                     } else {
-                        let loaded = self.load_family(fallback_name, features, None)?;
+                        let loaded = self.load_family(fallback_name, features, None, stretch)?;
                         self.font_ids_by_family_cache
                             .insert(fb_cache_key, loaded.clone());
                         loaded
@@ -738,7 +749,7 @@ impl CosmicTextSystemState {
         for run in font_runs {
             let run_end = offs + run.len;
 
-            let Some(properties) = self.font_match_properties(run.font_id) else {
+            let Some(properties) = self.font_match_properties(run.font_id, Stretch::Normal) else {
                 offs = run_end;
                 continue;
             };
@@ -1040,6 +1051,7 @@ fn find_best_match(
     }
 
     let target_weight = font.weight.0;
+    let target_stretch = cosmic_stretch(font.stretch);
     let target_italic = matches!(
         font.style,
         gpui::FontStyle::Italic | gpui::FontStyle::Oblique
@@ -1062,7 +1074,21 @@ fn find_best_match(
         );
         let style_penalty: u32 = if is_italic == target_italic { 0 } else { 1000 };
         let weight_diff = (face_info.weight.0 as i32 - target_weight as i32).unsigned_abs();
-        let score = style_penalty + weight_diff;
+        let stretch_rank = |stretch: Stretch| -> u32 {
+            match stretch {
+                Stretch::UltraCondensed => 0,
+                Stretch::ExtraCondensed => 1,
+                Stretch::Condensed => 2,
+                Stretch::SemiCondensed => 3,
+                Stretch::Normal => 4,
+                Stretch::SemiExpanded => 5,
+                Stretch::Expanded => 6,
+                Stretch::ExtraExpanded => 7,
+                Stretch::UltraExpanded => 8,
+            }
+        };
+        let stretch_diff = stretch_rank(face_info.stretch).abs_diff(stretch_rank(target_stretch));
+        let score = style_penalty + weight_diff + stretch_diff;
 
         if score < best_score {
             best_score = score;
@@ -1207,7 +1233,7 @@ fn font_into_properties(font: &gpui::Font) -> font_kit::properties::Properties {
             gpui::FontStyle::Oblique => font_kit::properties::Style::Oblique,
         },
         weight: font_kit::properties::Weight(font.weight.0),
-        stretch: Default::default(),
+        stretch: fontkit_stretch(font.stretch),
     }
 }
 
@@ -1222,17 +1248,53 @@ fn face_info_into_properties(
             cosmic_text::Style::Oblique => font_kit::properties::Style::Oblique,
         },
         weight: font_kit::properties::Weight(face_info.weight.0.into()),
-        stretch: match face_info.stretch {
-            cosmic_text::Stretch::Condensed => font_kit::properties::Stretch::CONDENSED,
-            cosmic_text::Stretch::Expanded => font_kit::properties::Stretch::EXPANDED,
-            cosmic_text::Stretch::ExtraCondensed => font_kit::properties::Stretch::EXTRA_CONDENSED,
-            cosmic_text::Stretch::ExtraExpanded => font_kit::properties::Stretch::EXTRA_EXPANDED,
-            cosmic_text::Stretch::Normal => font_kit::properties::Stretch::NORMAL,
-            cosmic_text::Stretch::SemiCondensed => font_kit::properties::Stretch::SEMI_CONDENSED,
-            cosmic_text::Stretch::SemiExpanded => font_kit::properties::Stretch::SEMI_EXPANDED,
-            cosmic_text::Stretch::UltraCondensed => font_kit::properties::Stretch::ULTRA_CONDENSED,
-            cosmic_text::Stretch::UltraExpanded => font_kit::properties::Stretch::ULTRA_EXPANDED,
-        },
+        stretch: fontkit_stretch(cgpui_stretch(face_info.stretch)),
+    }
+}
+
+#[cfg(feature = "font-kit")]
+fn fontkit_stretch(stretch: gpui::FontStretch) -> font_kit::properties::Stretch {
+    use font_kit::properties::Stretch as FontkitStretch;
+
+    match stretch {
+        gpui::FontStretch::UltraCondensed => FontkitStretch::ULTRA_CONDENSED,
+        gpui::FontStretch::ExtraCondensed => FontkitStretch::EXTRA_CONDENSED,
+        gpui::FontStretch::Condensed => FontkitStretch::CONDENSED,
+        gpui::FontStretch::SemiCondensed => FontkitStretch::SEMI_CONDENSED,
+        gpui::FontStretch::Normal => FontkitStretch::NORMAL,
+        gpui::FontStretch::SemiExpanded => FontkitStretch::SEMI_EXPANDED,
+        gpui::FontStretch::Expanded => FontkitStretch::EXPANDED,
+        gpui::FontStretch::ExtraExpanded => FontkitStretch::EXTRA_EXPANDED,
+        gpui::FontStretch::UltraExpanded => FontkitStretch::ULTRA_EXPANDED,
+    }
+}
+
+#[cfg(feature = "font-kit")]
+fn cgpui_stretch(stretch: cosmic_text::Stretch) -> gpui::FontStretch {
+    match stretch {
+        cosmic_text::Stretch::UltraCondensed => gpui::FontStretch::UltraCondensed,
+        cosmic_text::Stretch::ExtraCondensed => gpui::FontStretch::ExtraCondensed,
+        cosmic_text::Stretch::Condensed => gpui::FontStretch::Condensed,
+        cosmic_text::Stretch::SemiCondensed => gpui::FontStretch::SemiCondensed,
+        cosmic_text::Stretch::Normal => gpui::FontStretch::Normal,
+        cosmic_text::Stretch::SemiExpanded => gpui::FontStretch::SemiExpanded,
+        cosmic_text::Stretch::Expanded => gpui::FontStretch::Expanded,
+        cosmic_text::Stretch::ExtraExpanded => gpui::FontStretch::ExtraExpanded,
+        cosmic_text::Stretch::UltraExpanded => gpui::FontStretch::UltraExpanded,
+    }
+}
+
+fn cosmic_stretch(stretch: gpui::FontStretch) -> Stretch {
+    match stretch {
+        gpui::FontStretch::UltraCondensed => Stretch::UltraCondensed,
+        gpui::FontStretch::ExtraCondensed => Stretch::ExtraCondensed,
+        gpui::FontStretch::Condensed => Stretch::Condensed,
+        gpui::FontStretch::SemiCondensed => Stretch::SemiCondensed,
+        gpui::FontStretch::Normal => Stretch::Normal,
+        gpui::FontStretch::SemiExpanded => Stretch::SemiExpanded,
+        gpui::FontStretch::Expanded => Stretch::Expanded,
+        gpui::FontStretch::ExtraExpanded => Stretch::ExtraExpanded,
+        gpui::FontStretch::UltraExpanded => Stretch::UltraExpanded,
     }
 }
 
@@ -1814,7 +1876,10 @@ mod tests {
             pick_covering_slot('a', None, primary, &fb, &covers),
             Some(0)
         );
-        assert_eq!(pick_covering_slot('a', Some(0), primary, &fb, &covers), Some(0));
+        assert_eq!(
+            pick_covering_slot('a', Some(0), primary, &fb, &covers),
+            Some(0)
+        );
     }
 
     #[test]

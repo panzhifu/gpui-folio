@@ -28,15 +28,17 @@ use font_kit::{
     handle::Handle,
     hinting::HintingOptions,
     metrics::Metrics,
-    properties::{Style as FontkitStyle, Weight as FontkitWeight},
+    properties::{
+        Properties, Stretch as FontkitStretch, Style as FontkitStyle, Weight as FontkitWeight,
+    },
     source::SystemSource,
     sources::mem::MemSource,
 };
 use gpui::{
     Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
-    FontStyle, FontWeight, GlyphId, LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams,
-    Result, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString, Size, TextRenderingMode,
-    point, px, size, swap_rgba_pa_to_bgra,
+    FontStretch, FontStyle, FontWeight, GlyphId, LineLayout, Pixels, PlatformTextSystem,
+    RenderGlyphParams, Result, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString, Size,
+    TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
 };
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use pathfinder_geometry::{
@@ -166,10 +168,10 @@ impl PlatformTextSystem for AppleTextSystem {
 
             let ix = font_kit::matching::find_best_match(
                 &candidate_properties,
-                &font_kit::properties::Properties {
+                &Properties {
                     style: fontkit_style(font.style),
                     weight: fontkit_weight(font.weight),
-                    stretch: Default::default(),
+                    stretch: fontkit_stretch(font.stretch),
                 },
             )?;
 
@@ -718,6 +720,21 @@ fn fontkit_style(style: FontStyle) -> FontkitStyle {
         FontStyle::Normal => FontkitStyle::Normal,
         FontStyle::Italic => FontkitStyle::Italic,
         FontStyle::Oblique => FontkitStyle::Oblique,
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn fontkit_stretch(stretch: FontStretch) -> FontkitStretch {
+    match stretch {
+        FontStretch::UltraCondensed => FontkitStretch::ULTRA_CONDENSED,
+        FontStretch::ExtraCondensed => FontkitStretch::EXTRA_CONDENSED,
+        FontStretch::Condensed => FontkitStretch::CONDENSED,
+        FontStretch::SemiCondensed => FontkitStretch::SEMI_CONDENSED,
+        FontStretch::Normal => FontkitStretch::NORMAL,
+        FontStretch::SemiExpanded => FontkitStretch::SEMI_EXPANDED,
+        FontStretch::Expanded => FontkitStretch::EXPANDED,
+        FontStretch::ExtraExpanded => FontkitStretch::EXTRA_EXPANDED,
+        FontStretch::UltraExpanded => FontkitStretch::ULTRA_EXPANDED,
     }
 }
 

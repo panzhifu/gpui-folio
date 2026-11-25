@@ -7,9 +7,9 @@ use std::{
 use crate::{
     AbsoluteLength, App, BackdropGlass, Background, BackgroundTag, BorderStyle, Bounds,
     ContentMask, Corners, CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges,
-    EdgesRefinement, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla,
-    Length, Pixels, Point, PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled,
-    TextRun, Window, black, phi, point, px, quad, rems, size,
+    EdgesRefinement, Font, FontFallbacks, FontFeatures, FontStretch, FontStyle, FontWeight,
+    GridLocation, Hsla, Length, Pixels, Point, PointRefinement, Rgba, SharedString, Size,
+    SizeRefinement, Styled, TextRun, Window, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -467,6 +467,9 @@ pub struct TextStyle {
     /// The font style, e.g. italic
     pub font_style: FontStyle,
 
+    /// The static font stretch, e.g. condensed
+    pub font_stretch: FontStretch,
+
     /// The background color of the text
     pub background_color: Option<Hsla>,
 
@@ -501,6 +504,7 @@ impl Default for TextStyle {
             line_height: phi(),
             font_weight: FontWeight::default(),
             font_style: FontStyle::default(),
+            font_stretch: FontStretch::default(),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -554,6 +558,7 @@ impl TextStyle {
             fallbacks: self.font_fallbacks.clone(),
             weight: self.font_weight,
             style: self.font_style,
+            stretch: self.font_stretch,
         }
     }
 
@@ -572,6 +577,7 @@ impl TextStyle {
                 fallbacks: self.font_fallbacks.clone(),
                 weight: self.font_weight,
                 style: self.font_style,
+                stretch: self.font_stretch,
             },
             color: self.color,
             background_color: self.background_color,

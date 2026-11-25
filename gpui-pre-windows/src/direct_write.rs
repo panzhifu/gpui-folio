@@ -31,6 +31,7 @@ struct FontInfo {
     features: IDWriteTypography,
     fallbacks: Option<IDWriteFontFallback>,
     font_collection: IDWriteFontCollection1,
+    stretch: DWRITE_FONT_STRETCH,
 }
 
 pub(crate) struct DirectWriteTextSystem {
@@ -287,6 +288,7 @@ impl DirectWriteState {
         fallbacks: &FontFallbacks,
         factory: &IDWriteFactory5,
         system_font_collection: &IDWriteFontCollection1,
+        stretch: DWRITE_FONT_STRETCH,
     ) -> Result<Option<IDWriteFontFallback>> {
         let fallback_list = fallbacks.fallback_list();
         if fallback_list.is_empty() {
@@ -302,7 +304,7 @@ impl DirectWriteState {
                     .GetMatchingFonts(
                         &family_name,
                         DWRITE_FONT_WEIGHT_NORMAL,
-                        DWRITE_FONT_STRETCH_NORMAL,
+                        stretch,
                         DWRITE_FONT_STYLE_NORMAL,
                     )
                     .log_err()
@@ -357,6 +359,7 @@ impl DirectWriteState {
             ref fallbacks,
             weight,
             style,
+            stretch,
         }: &Font,
         collection: &IDWriteFontCollection1,
         factory: &IDWriteFactory5,
@@ -371,12 +374,13 @@ impl DirectWriteState {
         };
         let fontset = unsafe { collection.GetFontSet().log_err()? };
         let font_family_h = HSTRING::from(family.as_str());
+        let dwrite_stretch = font_stretch_to_dwrite(stretch);
         let font = unsafe {
             fontset
                 .GetMatchingFonts(
                     &font_family_h,
                     font_weight_to_dwrite(weight),
-                    DWRITE_FONT_STRETCH_NORMAL,
+                    dwrite_stretch,
                     font_style_to_dwrite(style),
                 )
                 .log_err()?
@@ -389,9 +393,14 @@ impl DirectWriteState {
                 let direct_write_features =
                     unsafe { Self::generate_font_features(factory, features).log_err()? };
                 let fallbacks = fallbacks.as_ref().and_then(|fallbacks| {
-                    Self::generate_font_fallbacks(fallbacks, factory, system_font_collection)
-                        .log_err()
-                        .flatten()
+                    Self::generate_font_fallbacks(
+                        fallbacks,
+                        factory,
+                        system_font_collection,
+                        dwrite_stretch,
+                    )
+                    .log_err()
+                    .flatten()
                 });
                 let font_info = FontInfo {
                     font_family_h: font_family_h.clone(),
@@ -399,6 +408,7 @@ impl DirectWriteState {
                     features: direct_write_features,
                     fallbacks,
                     font_collection: collection.clone(),
+                    stretch: dwrite_stretch,
                 };
                 Some(font_info)
             });
@@ -507,7 +517,7 @@ impl DirectWriteState {
                         collection,
                         font_info.font_face.GetWeight(),
                         font_info.font_face.GetStyle(),
-                        DWRITE_FONT_STRETCH_NORMAL,
+                        font_info.stretch,
                         font_size.as_f32(),
                         &components.locale,
                     )?
@@ -567,6 +577,7 @@ impl DirectWriteState {
                 text_layout.SetFontSize(font_size, text_range)?;
                 text_layout.SetFontStyle(font_info.font_face.GetStyle(), text_range)?;
                 text_layout.SetFontWeight(font_info.font_face.GetWeight(), text_range)?;
+                text_layout.SetFontStretch(font_info.stretch, text_range)?;
                 text_layout.SetTypography(&font_info.features, text_range)?;
 
                 break_ligatures = !break_ligatures;
@@ -1582,8 +1593,37 @@ fn font_weight_to_dwrite(weight: FontWeight) -> DWRITE_FONT_WEIGHT {
     DWRITE_FONT_WEIGHT(weight.0 as i32)
 }
 
+fn font_stretch_to_dwrite(stretch: FontStretch) -> DWRITE_FONT_STRETCH {
+    match stretch {
+        FontStretch::UltraCondensed => DWRITE_FONT_STRETCH_ULTRA_CONDENSED,
+        FontStretch::ExtraCondensed => DWRITE_FONT_STRETCH_EXTRA_CONDENSED,
+        FontStretch::Condensed => DWRITE_FONT_STRETCH_CONDENSED,
+        FontStretch::SemiCondensed => DWRITE_FONT_STRETCH_SEMI_CONDENSED,
+        FontStretch::Normal => DWRITE_FONT_STRETCH_NORMAL,
+        FontStretch::SemiExpanded => DWRITE_FONT_STRETCH_SEMI_EXPANDED,
+        FontStretch::Expanded => DWRITE_FONT_STRETCH_EXPANDED,
+        FontStretch::ExtraExpanded => DWRITE_FONT_STRETCH_EXTRA_EXPANDED,
+        FontStretch::UltraExpanded => DWRITE_FONT_STRETCH_ULTRA_EXPANDED,
+    }
+}
+
 fn font_weight_from_dwrite(value: DWRITE_FONT_WEIGHT) -> FontWeight {
     FontWeight(value.0 as f32)
+}
+
+fn font_stretch_from_dwrite(value: DWRITE_FONT_STRETCH) -> FontStretch {
+    match value {
+        DWRITE_FONT_STRETCH_ULTRA_CONDENSED => FontStretch::UltraCondensed,
+        DWRITE_FONT_STRETCH_EXTRA_CONDENSED => FontStretch::ExtraCondensed,
+        DWRITE_FONT_STRETCH_CONDENSED => FontStretch::Condensed,
+        DWRITE_FONT_STRETCH_SEMI_CONDENSED => FontStretch::SemiCondensed,
+        DWRITE_FONT_STRETCH_NORMAL => FontStretch::Normal,
+        DWRITE_FONT_STRETCH_SEMI_EXPANDED => FontStretch::SemiExpanded,
+        DWRITE_FONT_STRETCH_EXPANDED => FontStretch::Expanded,
+        DWRITE_FONT_STRETCH_EXTRA_EXPANDED => FontStretch::ExtraExpanded,
+        DWRITE_FONT_STRETCH_ULTRA_EXPANDED => FontStretch::UltraExpanded,
+        _ => FontStretch::Normal,
+    }
 }
 
 fn get_font_names_from_collection(
@@ -1615,11 +1655,13 @@ fn font_face_to_font(font_face: &IDWriteFontFace3, locale: &HSTRING) -> Option<F
     let family_name = get_name(localized_family_name, locale).log_err()?;
     let weight = unsafe { font_face.GetWeight() };
     let style = unsafe { font_face.GetStyle() };
+    let stretch = font_stretch_from_dwrite(unsafe { font_face.GetStretch() });
     Some(Font {
         family: family_name.into(),
         features: FontFeatures::default(),
         weight: font_weight_from_dwrite(weight),
         style: font_style_from_dwrite(style),
+        stretch,
         fallbacks: None,
     })
 }
