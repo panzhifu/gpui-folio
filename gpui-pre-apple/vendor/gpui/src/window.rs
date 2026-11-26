@@ -5103,6 +5103,7 @@ impl Window {
             scale_factor,
             is_emoji: false,
             subpixel_rendering,
+            aliased: false,
             dilation,
         };
 
@@ -5193,6 +5194,7 @@ impl Window {
             scale_factor,
             is_emoji: true,
             subpixel_rendering: false,
+            aliased: false,
             dilation: 0,
         };
 

@@ -2952,6 +2952,8 @@ pub enum TextRenderingMode {
     Subpixel,
     /// Use grayscale text rendering.
     Grayscale,
+    /// Disable antialiasing entirely; rasterization still produces a single-channel mask.
+    Aliased,
 }
 
 /// The options that can be configured for a file dialog prompt

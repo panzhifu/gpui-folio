@@ -485,8 +485,8 @@ impl AppleTextSystemState {
                 .subpixel_variant
                 .map(|v| v as f32 / SUBPIXEL_VARIANTS_X as f32);
             cx.set_text_drawing_mode(CGTextDrawingMode::CGTextFill);
-            cx.set_allows_antialiasing(true);
-            cx.set_should_antialias(true);
+            cx.set_allows_antialiasing(!params.aliased);
+            cx.set_should_antialias(!params.aliased);
             cx.set_allows_font_subpixel_positioning(true);
             cx.set_should_subpixel_position_fonts(true);
             cx.set_allows_font_subpixel_quantization(false);

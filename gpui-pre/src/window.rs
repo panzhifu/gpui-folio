@@ -5241,6 +5241,27 @@ impl Window {
         font_size: Pixels,
         color: Hsla,
     ) -> Result<()> {
+        self.paint_glyph_with_mode(
+            origin,
+            font_id,
+            glyph_id,
+            font_size,
+            color,
+            TextRenderingMode::PlatformDefault,
+        )
+    }
+
+    /// Paint one shaped glyph with an explicit rendering mode, without changing the
+    /// window-wide mode used by every other text primitive.
+    pub fn paint_glyph_with_mode(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        mode: TextRenderingMode,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
@@ -5258,7 +5279,8 @@ impl Window {
             (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
         );
         let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
-        let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
+        let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size, mode);
+        let aliased = !Self::should_antialias(mode);
         let dilation = self.text_system().glyph_dilation_for_color(color);
         let params = RenderGlyphParams {
             font_id,
@@ -5268,6 +5290,7 @@ impl Window {
             scale_factor,
             is_emoji: false,
             subpixel_rendering,
+            aliased,
             dilation,
         };
 
@@ -5311,7 +5334,15 @@ impl Window {
         Ok(())
     }
 
-    fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+    fn should_use_subpixel_rendering(
+        &self,
+        font_id: FontId,
+        font_size: Pixels,
+        mode: TextRenderingMode,
+    ) -> bool {
+        if !Self::should_antialias(mode) {
+            return false;
+        }
         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
         }
@@ -5320,7 +5351,7 @@ impl Window {
             return false;
         }
 
-        let mode = match self.text_rendering_mode.get() {
+        let mode = match mode {
             TextRenderingMode::PlatformDefault => self
                 .text_system()
                 .recommended_rendering_mode(font_id, font_size),
@@ -5328,6 +5359,10 @@ impl Window {
         };
 
         mode == TextRenderingMode::Subpixel
+    }
+
+    fn should_antialias(mode: TextRenderingMode) -> bool {
+        mode != TextRenderingMode::Aliased
     }
 
     /// Paints an emoji glyph into the scene for the next frame at the current z-index.
@@ -5358,6 +5393,7 @@ impl Window {
             scale_factor,
             is_emoji: true,
             subpixel_rendering: false,
+            aliased: false,
             dilation: 0,
         };
 

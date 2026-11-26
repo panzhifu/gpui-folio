@@ -670,6 +670,12 @@ impl DirectWriteState {
         &self,
         params: &RenderGlyphParams,
     ) -> Result<(DWRITE_RENDERING_MODE1, DWRITE_GRID_FIT_MODE)> {
+        if params.aliased {
+            return Ok((
+                DWRITE_RENDERING_MODE1_ALIASED,
+                DWRITE_GRID_FIT_MODE_DISABLED,
+            ));
+        }
         let font = &self.fonts[params.font_id.0];
         let mut rendering_mode = DWRITE_RENDERING_MODE1::default();
         let mut grid_fit_mode = DWRITE_GRID_FIT_MODE::default();

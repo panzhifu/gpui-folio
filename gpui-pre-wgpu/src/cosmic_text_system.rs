@@ -552,6 +552,11 @@ impl CosmicTextSystemState {
                     let expanded = image.data.iter().flat_map(|&a| [a, a, a, a]).collect();
                     Ok((bitmap_size, expanded))
                 } else {
+                    if params.aliased {
+                        for byte in &mut image.data {
+                            *byte = if *byte >= 128 { 255 } else { 0 };
+                        }
+                    }
                     Ok((bitmap_size, image.data))
                 }
             }

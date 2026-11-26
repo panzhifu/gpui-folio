@@ -1167,6 +1167,7 @@ pub struct RenderGlyphParams {
     pub scale_factor: f32,
     pub is_emoji: bool,
     pub subpixel_rendering: bool,
+    pub aliased: bool,
     pub dilation: u8,
 }
 
@@ -1181,6 +1182,7 @@ impl Hash for RenderGlyphParams {
         self.scale_factor.to_bits().hash(state);
         self.is_emoji.hash(state);
         self.subpixel_rendering.hash(state);
+        self.aliased.hash(state);
         self.dilation.hash(state);
     }
 }
@@ -1476,5 +1478,41 @@ mod missing_glyph_tests {
 
     fn missing_glyph(grapheme: &'static str) -> MissingGlyph {
         MissingGlyph::new(grapheme.into(), FallbackFontClass::Proportional)
+    }
+}
+
+#[cfg(test)]
+mod glyph_cache_key_tests {
+    use super::*;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    #[test]
+    fn aliased_glyph_params_have_distinct_cache_keys() {
+        let plain = RenderGlyphParams {
+            font_id: FontId(7),
+            glyph_id: GlyphId(3),
+            font_size: px(16.),
+            subpixel_variant: Default::default(),
+            scale_factor: 1.0,
+            is_emoji: false,
+            subpixel_rendering: false,
+            aliased: false,
+            dilation: 0,
+        };
+        let aliased = RenderGlyphParams {
+            aliased: true,
+            ..plain.clone()
+        };
+        assert_ne!(plain, aliased);
+        let hash = |params: &RenderGlyphParams| {
+            let mut hasher = DefaultHasher::new();
+            params.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_ne!(hash(&plain), hash(&aliased));
+        assert_eq!(
+            AtlasKey::from(aliased).texture_kind(),
+            AtlasTextureKind::Monochrome
+        );
     }
 }
