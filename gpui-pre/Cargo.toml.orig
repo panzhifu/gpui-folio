@@ -1,9 +1,16 @@
 [package]
 name = "gpui-pre"
+<<<<<<< HEAD
 version = "0.3.11"
 edition = { workspace = true }
 authors = ["Nathan Sobo <nathan@zed.dev>"]
 description = "Zed's GPU-accelerated UI framework (gpui-pre snapshot of zed@f816e1f)"
+=======
+version = "0.3.14"
+edition = { workspace = true }
+authors = ["Nathan Sobo <nathan@zed.dev>"]
+description = "Zed's GPU-accelerated UI framework (gpui-pre snapshot of zed@f126950)"
+>>>>>>> theirs
 repository = "https://github.com/zed-industries/zed"
 publish = true
 license = "Apache-2.0"
@@ -20,7 +27,11 @@ ignored-paths = ["src/_ownership_and_data_flow.rs", "benches/focus_cleanup.rs"]
 [package.metadata.gpui-pre]
 zed-crate = "gpui"
 zed-version = "0.2.2"
+<<<<<<< HEAD
 zed-rev = "f816e1f9263e3a8ef63c4baaa02e1441ce1c6038"
+=======
+zed-rev = "f126950f9d3b62666f97437ae5d4ccac2272c4db"
+>>>>>>> theirs
 
 [lib]
 path = "src/gpui.rs"
@@ -117,9 +128,10 @@ unicode-segmentation = { workspace = true }
 gpui_util = { workspace = true }
 hdrhistogram = { workspace = true, optional = true }
 waker-fn = "1.2.0"
-lyon = "1.0"
+lyon_path = "1.0.19"
 pin-project = "1.1.10"
 spin = { workspace = true }
+tiny-skia-path = "0.11"
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 web-time = { workspace = true, optional = true }
@@ -172,6 +184,14 @@ windows = { workspace = true, features = [
 
 [lints]
 workspace = true
+
+[[example]]
+name = "native_view"
+path = "examples/native_view.rs"
+
+[[example]]
+name = "native_view_appkit_field"
+path = "examples/native_view_appkit_field.rs"
 
 [[example]]
 name = "hello_world"

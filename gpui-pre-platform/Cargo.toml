@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "gpui-pre-platform"
-version = "0.3.12"
+version = "0.3.14"
 build = false
 publish = true
 autolib = false
@@ -20,7 +20,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Zed's `gpui_platform` crate (gpui-pre snapshot of zed@f816e1f)"
+description = "Zed's `gpui_platform` crate (gpui-pre snapshot of zed@f126950)"
 readme = false
 license = "Apache-2.0"
 repository = "https://github.com/zed-industries/zed"
@@ -29,7 +29,7 @@ resolver = "2"
 [package.metadata.gpui-pre]
 zed-crate = "gpui_platform"
 zed-version = "0.1.0"
-zed-rev = "f816e1f9263e3a8ef63c4baaa02e1441ce1c6038"
+zed-rev = "f126950f9d3b62666f97437ae5d4ccac2272c4db"
 
 [features]
 bench-support = [
@@ -77,22 +77,16 @@ path = "benches/inspector_render.rs"
 harness = false
 required-features = ["bench-support"]
 
-[[bench]]
-name = "randomized_element_tree"
-path = "benches/randomized_element_tree.rs"
-harness = false
-required-features = ["bench-support"]
-
 [dependencies.anyhow]
 version = "1.0.86"
 
 [dependencies.gpui]
-version = "=0.3.12"
+version = "=0.3.14"
 default-features = false
 package = "gpui-pre"
 
 [target.'cfg(all(any(target_os = "linux", target_os = "freebsd"), not(target_env = "ohos")))'.dependencies.gpui_linux]
-version = "=0.3.12"
+version = "=0.3.14"
 default-features = false
 package = "gpui-pre-linux"
 
@@ -100,32 +94,32 @@ package = "gpui-pre-linux"
 version = "0.1.7"
 
 [target.'cfg(target_family = "wasm")'.dependencies.gpui_web]
-version = "=0.3.12"
+version = "=0.3.14"
 default-features = false
 package = "gpui-pre-web"
 
 [target.'cfg(target_os = "ios")'.dependencies.gpui_ios]
-version = "=0.3.12"
+version = "=0.3.14"
 package = "gpui-pre-ios"
 
 [target.'cfg(target_os = "linux")'.dependencies.gpui_wgpu]
-version = "=0.3.12"
+version = "=0.3.14"
 optional = true
 package = "gpui-pre-wgpu"
 
 [target.'cfg(target_os = "macos")'.dependencies.gpui_macos]
-version = "=0.3.12"
+version = "=0.3.14"
 default-features = false
 package = "gpui-pre-macos"
 
 [target.'cfg(target_os = "windows")'.dependencies.gpui]
-version = "=0.3.12"
+version = "=0.3.14"
 features = ["windows-manifest"]
 default-features = false
 package = "gpui-pre"
 
 [target.'cfg(target_os = "windows")'.dependencies.gpui_windows]
-version = "=0.3.12"
+version = "=0.3.14"
 default-features = false
 package = "gpui-pre-windows"
 
