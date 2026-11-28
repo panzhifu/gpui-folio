@@ -1667,7 +1667,7 @@ pub trait PlatformTextSystem: Send + Sync {
     /// should override it.
     fn add_font_files(&self, paths: Vec<std::path::PathBuf>) -> Result<Vec<Vec<String>>> {
         let _ = paths;
-        bail!("add_font_files is not supported on this platform")
+        Err(anyhow::anyhow!("add_font_files is not supported on this platform"))
     }
 
     /// Removes every face backed by the given files from the database, so a
@@ -1675,7 +1675,7 @@ pub trait PlatformTextSystem: Send + Sync {
     /// memory until restart.
     fn remove_font_files(&self, paths: Vec<std::path::PathBuf>) -> Result<()> {
         let _ = paths;
-        bail!("remove_font_files is not supported on this platform")
+        Err(anyhow::anyhow!("remove_font_files is not supported on this platform"))
     }
     /// Installs a nonblocking sink for unresolved grapheme clusters.
     fn set_missing_glyph_sink(&self, _sink: Option<Arc<dyn MissingGlyphSink>>) {}
