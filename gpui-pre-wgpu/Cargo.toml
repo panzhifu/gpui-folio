@@ -198,3 +198,8 @@ priority = 0
 name = "page_curl_offscreen"
 path = "examples/page_curl_offscreen.rs"
 required-features = ["offscreen"]
+
+[[example]]
+name = "backdrop_glass_offscreen"
+path = "examples/backdrop_glass_offscreen.rs"
+required-features = ["offscreen"]

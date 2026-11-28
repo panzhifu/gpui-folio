@@ -210,7 +210,8 @@ fn create_pipelines(
                   fs: &str,
                   layout: &wgpu::BindGroupLayout,
                   target: &wgpu::ColorTargetState,
-                  vertex_buffers: &[Option<wgpu::VertexBufferLayout<'_>>]| {
+                  vertex_buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
+                  depth_stencil: Option<wgpu::DepthStencilState>| {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(label),
             bind_group_layouts: &[Some(layout)],
@@ -240,7 +241,7 @@ fn create_pipelines(
                 polygon_mode: wgpu::PolygonMode::Fill,
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -283,6 +284,7 @@ fn create_pipelines(
             &blur_layout,
             &blur_target,
             &[],
+            None,
         ),
         blur_h: create(
             "backdrop_blur_h",
@@ -291,6 +293,7 @@ fn create_pipelines(
             &blur_layout,
             &blur_target,
             &[],
+            None,
         ),
         blur_v: create(
             "backdrop_blur_v",
@@ -299,6 +302,7 @@ fn create_pipelines(
             &blur_layout,
             &blur_target,
             &[],
+            None,
         ),
         glass: create(
             "backdrop_glass",
@@ -307,6 +311,16 @@ fn create_pipelines(
             &glass_layout,
             &glass_target,
             &glass_vertices,
+            // 玻璃画在主 pass 里，那一趟从 0.3.14 起带 Depth32Float 附件；管线不声明同格式的
+            // 深度状态就与 pass 不兼容，整帧提交作废（黑屏）。玻璃是叠加层，按绘制顺序压上去
+            // 即可：不写深度、恒过比较。
+            Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
         ),
         present: create(
             "backdrop_present",
@@ -315,6 +329,7 @@ fn create_pipelines(
             &present_layout,
             &blur_target,
             &[],
+            None,
         ),
         blur_layout,
         glass_layout,
