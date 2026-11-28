@@ -322,6 +322,31 @@ impl TextSystem {
         Ok(families)
     }
 
+    /// Add font files from disk and return the family names the platform database
+    /// reports for each path (outer index = path, inner = families).
+    ///
+    /// Unlike [`Self::add_fonts`], the bytes stay on disk: the database keeps the
+    /// paths and maps the files in lazily, so a registered-but-unused font does
+    /// not hold memory. Paths the database already knows are skipped by the
+    /// backend and still report their families.
+    pub fn add_font_files(&self, paths: Vec<std::path::PathBuf>) -> Result<Vec<Vec<String>>> {
+        let families = self.platform_text_system.add_font_files(paths)?;
+        self.font_ids_by_font.write().clear();
+        self.missing_glyph_reporter.reset();
+        self.font_generation.fetch_add(1, Ordering::Release);
+        Ok(families)
+    }
+
+    /// Remove every face backed by the given files from the platform database.
+    /// Cached font resolution is invalidated just like an installation.
+    pub fn remove_font_files(&self, paths: Vec<std::path::PathBuf>) -> Result<()> {
+        self.platform_text_system.remove_font_files(paths)?;
+        self.font_ids_by_font.write().clear();
+        self.missing_glyph_reporter.reset();
+        self.font_generation.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
     /// Takes the receiver for missing-glyph reports.
     ///
     /// Only one receiver is available for each text system. Returns `None` when

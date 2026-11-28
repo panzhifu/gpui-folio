@@ -181,6 +181,14 @@ impl PlatformTextSystem for CosmicTextSystem {
         self.0.write().add_fonts_with_families(fonts)
     }
 
+    fn add_font_files(&self, paths: Vec<std::path::PathBuf>) -> Result<Vec<Vec<String>>> {
+        self.0.write().add_font_files(paths)
+    }
+
+    fn remove_font_files(&self, paths: Vec<std::path::PathBuf>) -> Result<()> {
+        self.0.write().remove_font_files(paths)
+    }
+
     fn set_missing_glyph_sink(&self, sink: Option<Arc<dyn MissingGlyphSink>>) {
         self.0.write().missing_glyph_sink = sink;
     }
@@ -300,6 +308,16 @@ impl PlatformTextSystem for CosmicTextSystem {
     }
 }
 
+/// The file a face's bytes come from, if the source is file-backed.
+/// Byte sources (`Binary`, bundled assets) have no path and are never matched.
+fn face_source_path(source: &cosmic_text::fontdb::Source) -> Option<&std::path::Path> {
+    match source {
+        cosmic_text::fontdb::Source::File(path) => Some(path.as_path()),
+        cosmic_text::fontdb::Source::SharedFile(path, _) => Some(path.as_path()),
+        _ => None,
+    }
+}
+
 impl CosmicTextSystemState {
     fn loaded_font(&self, font_id: FontId) -> &LoadedFont {
         &self.loaded_fonts[font_id.0]
@@ -384,6 +402,67 @@ impl CosmicTextSystemState {
             out.push(families);
         }
         Ok(out)
+    }
+
+    /// Path-backed registration with lazy, file-mapped bytes.
+    ///
+    /// `Source::File` keeps only face metadata resident; the bytes are mapped in
+    /// when a face is first used (`FontSystem::get_font` converts the source to
+    /// a shared mapping), so file-backed pages can be evicted by the OS. Paths
+    /// the database already holds (a startup whitelist, an earlier scan) are not
+    /// loaded again — a byte-source copy of the same file cannot be detected by
+    /// name and would duplicate every face — and their known families are
+    /// reported so the caller can index them regardless.
+    #[profiling::function]
+    fn add_font_files(&mut self, paths: Vec<std::path::PathBuf>) -> Result<Vec<Vec<String>>> {
+        self.font_ids_by_family_cache.clear();
+        let db = self.font_system.db_mut();
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            let known: Vec<_> = db
+                .faces()
+                .filter(|face| face_source_path(&face.source) == Some(path.as_path()))
+                .map(|face| face.id)
+                .collect();
+            let ids = if known.is_empty() {
+                db.load_font_source(cosmic_text::fontdb::Source::File(path.clone()))
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            } else {
+                known
+            };
+            let mut families: Vec<String> = Vec::new();
+            for id in ids {
+                if let Some(face) = db.face(id) {
+                    for (family, _) in &face.families {
+                        if !families.contains(family) {
+                            families.push(family.clone());
+                        }
+                    }
+                }
+            }
+            out.push(families);
+        }
+        Ok(out)
+    }
+
+    #[profiling::function]
+    fn remove_font_files(&mut self, paths: Vec<std::path::PathBuf>) -> Result<()> {
+        self.font_ids_by_family_cache.clear();
+        let db = self.font_system.db_mut();
+        let stale: Vec<_> = db
+            .faces()
+            .filter(|face| {
+                paths
+                    .iter()
+                    .any(|path| face_source_path(&face.source) == Some(path.as_path()))
+            })
+            .map(|face| face.id)
+            .collect();
+        for id in stale {
+            db.remove_face(id);
+        }
+        Ok(())
     }
 
     #[profiling::function]

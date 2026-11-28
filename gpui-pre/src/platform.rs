@@ -1654,6 +1654,29 @@ pub trait PlatformTextSystem: Send + Sync {
         }
         Ok(out)
     }
+
+    /// Like [`Self::add_fonts_with_families`], but the sources are font files on
+    /// disk: the database keeps only the paths and maps the bytes in lazily
+    /// (fontdb's `Source::File`), so file-backed pages can be evicted by the OS
+    /// instead of staying resident. Paths already present in the database are
+    /// skipped; the family names they report still come back, so a caller can
+    /// index every path it hands over.
+    ///
+    /// The default implementation reports unsupported: lazy, path-backed
+    /// registration needs direct database access. Backends built on fontdb
+    /// should override it.
+    fn add_font_files(&self, paths: Vec<std::path::PathBuf>) -> Result<Vec<Vec<String>>> {
+        let _ = paths;
+        bail!("add_font_files is not supported on this platform")
+    }
+
+    /// Removes every face backed by the given files from the database, so a
+    /// deleted font can actually leave the process instead of lingering in
+    /// memory until restart.
+    fn remove_font_files(&self, paths: Vec<std::path::PathBuf>) -> Result<()> {
+        let _ = paths;
+        bail!("remove_font_files is not supported on this platform")
+    }
     /// Installs a nonblocking sink for unresolved grapheme clusters.
     fn set_missing_glyph_sink(&self, _sink: Option<Arc<dyn MissingGlyphSink>>) {}
     /// Get all available font names.
