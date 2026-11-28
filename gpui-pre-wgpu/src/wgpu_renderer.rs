@@ -1974,6 +1974,9 @@ impl WgpuRendererCore {
             return;
         }
         pass.set_pipeline(pipeline);
+        // globals 只是每帧一份，仍逐次设置：翻页与玻璃会把 pass 拆开重开，
+        // 重开后的 pass 不继承上一个 pass 的绑组状态。
+        pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
         pass.draw(
             0..4,
@@ -1999,6 +2002,7 @@ impl WgpuRendererCore {
             return Ok(());
         };
         pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &sprite_instances.bind_group, &[]);
         pass.set_bind_group(2, &texture.bind_group, &[]);
         pass.draw(
