@@ -239,7 +239,12 @@ struct WgpuRendererCore {
     /// Read by the headless renderer to create its render target.
     #[cfg(all(
         not(target_family = "wasm"),
-        any(test, feature = "bench-support", feature = "test-support")
+        any(
+            test,
+            feature = "bench-support",
+            feature = "test-support",
+            feature = "offscreen"
+        )
     ))]
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
@@ -1326,7 +1331,12 @@ impl WgpuRendererCore {
             depth_texture: None,
             #[cfg(all(
                 not(target_family = "wasm"),
-                any(test, feature = "bench-support", feature = "test-support")
+                any(
+                    test,
+                    feature = "bench-support",
+                    feature = "test-support",
+                    feature = "offscreen"
+                )
             ))]
             target_format,
             max_texture_size,
